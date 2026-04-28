@@ -38,6 +38,12 @@ python ./gr00t/eval/run_gr00t_server.py \
 LD_PRELOAD="$CONDA_PREFIX/lib/libstdc++.so.6" ~/Project/IsaacLab/isaaclab.sh -p examples/IsaacLab/load_xmate3_with_right_l10hand_urdf.py
 ```
 
+打开手部摄像头的开关
 ```bash
 LD_PRELOAD="$CONDA_PREFIX/lib/libstdc++.so.6" ~/Project/IsaacLab/isaaclab.sh -p examples/IsaacLab/load_xmate3_with_right_l10hand_urdf.py --enable_cameras
+```
+
+### 4. 启动isaaclab的rokae+l10手数据采集的回放
+```bash
+LD_PRELOAD="$CONDA_PREFIX/lib/libstdc++.so.6" ~/Project/IsaacLab/isaaclab.sh -p examples/IsaacLab/play_lerobot_rokae_xmate3_l10hand.py --enable_cameras
 ```
