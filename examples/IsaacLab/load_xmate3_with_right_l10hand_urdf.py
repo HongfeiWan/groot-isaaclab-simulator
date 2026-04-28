@@ -5,12 +5,9 @@
 """Minimal IsaacLab script: load combined xMate3 + right L10 hand URDF into the stage.
 
 运行（用 IsaacLab 的 Python）：
-
     ~/Project/IsaacLab/isaaclab.sh -p examples/IsaacLab/load_xmate3_with_right_l10hand_urdf.py
-
 它会把：
 - `demo_data/l10_hand/xMate3_with_right_L10hand.urdf`
-
 直接导入到 USD stage，用于可视化检查。
 """
 
@@ -25,6 +22,19 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 COMBINED_URDF_PATH = REPO_ROOT / "demo_data" / "l10_hand" / "xMate3_with_right_L10hand.urdf"
 D405_JSON_PATH = REPO_ROOT / "d405json.json"
+
+# Hand joint drive gains: (stiffness, damping)
+GAINS: dict[str, tuple[float, float]] = {
+    "thumb_cmc_roll": (3000.0, 300.0),
+    "thumb_cmc_yaw": (4000.0, 400.0),
+    "thumb_cmc_pitch": (5000.0, 500.0),
+    "mcp_roll": (2500.0, 250.0),
+    "mcp_pitch": (5000.0, 500.0),
+    "thumb_mcp": (3500.0, 350.0),
+    "thumb_ip": (2500.0, 250.0),
+    "pip": (3000.0, 300.0),
+    "dip": (1800.0, 180.0),
+}
 
 
 def _parse_args() -> tuple[argparse.Namespace, object]:
@@ -297,6 +307,160 @@ def _open_camera_viewport_window(camera_prim_path: str) -> None:
         print(f"[warn] Failed to set viewport camera_path: {e}", flush=True)
 
 
+def _apply_hand_drive_gains(*, root_prim_path: str) -> None:
+    """Apply PhysX drive stiffness/damping to hand joints under the imported robot.
+
+    This edits USD/PhysX schema attributes directly (no articulation view required).
+    """
+    try:
+        import omni.usd  # type: ignore
+        from pxr import PhysxSchema, UsdPhysics  # type: ignore
+    except Exception as e:
+        print(f"[warn] PhysX schema not available; skip hand gains: {e}", flush=True)
+        return
+
+    stage = omni.usd.get_context().get_stage()
+    if stage is None:
+        print("[warn] USD stage not available; skip hand gains.", flush=True)
+        return
+
+    root_prim = stage.GetPrimAtPath(root_prim_path)
+    if not root_prim or not root_prim.IsValid():
+        print(f"[warn] Robot prim not found for gains: {root_prim_path}", flush=True)
+        return
+    root_prefix = str(root_prim.GetPath())
+    if not root_prefix.endswith("/"):
+        root_prefix = root_prefix + "/"
+
+    def _pick_gain(joint_name: str) -> tuple[float, float] | None:
+        if joint_name in ("thumb_cmc_roll", "thumb_cmc_yaw", "thumb_cmc_pitch", "thumb_mcp", "thumb_ip"):
+            return GAINS[joint_name]
+        if joint_name.endswith("_mcp_roll"):
+            return GAINS["mcp_roll"]
+        if joint_name.endswith("_mcp_pitch"):
+            return GAINS["mcp_pitch"]
+        if joint_name.endswith("_pip"):
+            return GAINS["pip"]
+        if joint_name.endswith("_dip"):
+            return GAINS["dip"]
+        return None
+
+    applied = 0
+    skipped = 0
+    for prim in stage.Traverse():
+        prim_path = str(prim.GetPath())
+        if prim_path != str(root_prim.GetPath()) and not prim_path.startswith(root_prefix):
+            continue
+        name = prim.GetName()
+        gain = _pick_gain(name)
+        if gain is None:
+            continue
+
+        k, d = gain
+        try:
+            drive = UsdPhysics.DriveAPI.Apply(prim, "angular")
+            drive.CreateStiffnessAttr(float(k))
+            drive.CreateDampingAttr(float(d))
+            drive.CreateMaxForceAttr(1.0e6)
+            # Ensure the attribute exists; targets may be overwritten per-tick for mimic joints.
+            drive.CreateTargetPositionAttr(0.0)
+
+            physx_drive = PhysxSchema.PhysxDriveAPI.Apply(prim, "angular")
+            physx_drive.CreateStiffnessAttr(float(k))
+            physx_drive.CreateDampingAttr(float(d))
+            physx_drive.CreateMaxForceAttr(1.0e6)
+            applied += 1
+        except Exception:
+            skipped += 1
+
+    print(f"[hand_gains] applied={applied}, skipped={skipped}, root={root_prim_path}", flush=True)
+
+
+def _collect_named_prims_under(*, root_prim_path: str, names: set[str]) -> dict[str, object]:
+    """Collect first prim for each name under the given root path."""
+    import omni.usd  # type: ignore
+
+    stage = omni.usd.get_context().get_stage()
+    if stage is None:
+        return {}
+
+    root = stage.GetPrimAtPath(root_prim_path)
+    if not root or not root.IsValid():
+        return {}
+
+    root_prefix = str(root.GetPath())
+    if not root_prefix.endswith("/"):
+        root_prefix = root_prefix + "/"
+
+    found: dict[str, object] = {}
+    for prim in stage.Traverse():
+        prim_path = str(prim.GetPath())
+        if prim_path != str(root.GetPath()) and not prim_path.startswith(root_prefix):
+            continue
+        n = prim.GetName()
+        if n in names and n not in found:
+            found[n] = prim
+            if len(found) == len(names):
+                break
+    return found
+
+
+def _update_hand_mimic_targets(*, root_prim_path: str, prims: dict[str, object]) -> None:
+    """Update mimic joints' drive targetPosition each tick from master joints.
+
+    Mimic mapping (your spec):
+    - thumb_mcp = 1.3898 * thumb_cmc_pitch
+    - thumb_ip  = 1.5080 * thumb_cmc_pitch
+    - pip       = 1.3462 * mcp_pitch
+    - dip       = 0.4616 * mcp_pitch
+    """
+    try:
+        from pxr import UsdPhysics  # type: ignore
+    except Exception:
+        return
+
+    def _get_target(name: str) -> float:
+        prim = prims.get(name)
+        if prim is None:
+            return 0.0
+        try:
+            drive = UsdPhysics.DriveAPI.Get(prim, "angular")
+            attr = drive.GetTargetPositionAttr()
+            v = attr.Get()
+            return float(v) if v is not None else 0.0
+        except Exception:
+            return 0.0
+
+    def _set_target(name: str, value: float) -> None:
+        prim = prims.get(name)
+        if prim is None:
+            return
+        try:
+            drive = UsdPhysics.DriveAPI.Apply(prim, "angular")
+            drive.CreateTargetPositionAttr(0.0)
+            drive.GetTargetPositionAttr().Set(float(value))
+        except Exception:
+            return
+
+    q_thumb_cmc_pitch = _get_target("thumb_cmc_pitch")
+    q_index_mcp_pitch = _get_target("index_mcp_pitch")
+    q_middle_mcp_pitch = _get_target("middle_mcp_pitch")
+    q_ring_mcp_pitch = _get_target("ring_mcp_pitch")
+    q_pinky_mcp_pitch = _get_target("pinky_mcp_pitch")
+
+    _set_target("thumb_mcp", 1.3898 * q_thumb_cmc_pitch)
+    _set_target("thumb_ip", 1.5080 * q_thumb_cmc_pitch)
+
+    _set_target("index_pip", 1.3462 * q_index_mcp_pitch)
+    _set_target("index_dip", 0.4616 * q_index_mcp_pitch)
+    _set_target("middle_pip", 1.3462 * q_middle_mcp_pitch)
+    _set_target("middle_dip", 0.4616 * q_middle_mcp_pitch)
+    _set_target("ring_pip", 1.3462 * q_ring_mcp_pitch)
+    _set_target("ring_dip", 0.4616 * q_ring_mcp_pitch)
+    _set_target("pinky_pip", 1.3462 * q_pinky_mcp_pitch)
+    _set_target("pinky_dip", 0.4616 * q_pinky_mcp_pitch)
+
+
 def main() -> None:
     args, simulation_app = _parse_args()
 
@@ -312,6 +476,42 @@ def main() -> None:
         make_instanceable=bool(args.make_instanceable),
     )
     print(f"Imported URDF: {urdf} -> {args.prim_path}", flush=True)
+
+    # Apply L10 hand joint stiffness/damping.
+    _apply_hand_drive_gains(root_prim_path=str(args.prim_path))
+
+    # Cache prim handles for master + mimic joints so we can update mimic targets every tick.
+    _HAND_JOINT_NAMES = {
+        # masters
+        "thumb_cmc_roll",
+        "thumb_cmc_yaw",
+        "thumb_cmc_pitch",
+        "index_mcp_roll",
+        "index_mcp_pitch",
+        "middle_mcp_pitch",
+        "ring_mcp_roll",
+        "ring_mcp_pitch",
+        "pinky_mcp_roll",
+        "pinky_mcp_pitch",
+        # mimics (must be updated every tick)
+        "index_pip",
+        "index_dip",
+        "middle_pip",
+        "middle_dip",
+        "ring_pip",
+        "ring_dip",
+        "pinky_pip",
+        "pinky_dip",
+        "thumb_mcp",
+        "thumb_ip",
+    }
+    hand_prims = _collect_named_prims_under(root_prim_path=str(args.prim_path), names=_HAND_JOINT_NAMES)
+    if hand_prims:
+        missing = sorted(_HAND_JOINT_NAMES.difference(hand_prims.keys()))
+        if missing:
+            print(f"[hand_mimic] missing prims: {missing}", flush=True)
+        else:
+            print("[hand_mimic] all required joint prims found.", flush=True)
 
     d405 = None
     try:
@@ -359,6 +559,9 @@ def main() -> None:
 
     try:
         while simulation_app.is_running():
+            # Keep mimic joints' targetPosition consistent with masters (no independent control).
+            if hand_prims:
+                _update_hand_mimic_targets(root_prim_path=str(args.prim_path), prims=hand_prims)
             simulation_app.update()
     finally:
         simulation_app.close()

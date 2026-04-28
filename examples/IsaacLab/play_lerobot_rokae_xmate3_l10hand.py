@@ -36,6 +36,8 @@ LOADER_SCRIPT_PATH = REPO_ROOT / "examples" / "IsaacLab" / "load_xmate3_with_rig
 
 # Keep a world reference alive for the lifetime of the script.
 _WORLD_REF = None
+_LOADER_REF = None
+_HAND_PRIMS_REF = None
 
 
 def _parse_args() -> tuple[argparse.Namespace, object]:
@@ -136,7 +138,9 @@ def _import_loader_module():
 
 def _init_robot_scene(*, prim_path: str) -> "SingleArticulation":
     # Reuse the existing loader script to build the stage (URDF import + camera mount + viewport window).
+    global _LOADER_REF, _HAND_PRIMS_REF
     loader = _import_loader_module()
+    _LOADER_REF = loader
 
     # Create a simulation World so physics views are available (Isaac Sim 5.1 requirement).
     global _WORLD_REF
@@ -162,6 +166,45 @@ def _init_robot_scene(*, prim_path: str) -> "SingleArticulation":
         _WORLD_REF.reset()
     except Exception:
         pass
+
+    # Apply the same hand drive stiffness/damping as the loader script.
+    try:
+        loader._apply_hand_drive_gains(root_prim_path=str(prim_path))  # type: ignore[attr-defined]  # noqa: SLF001
+    except Exception as e:
+        print(f"[warn] failed to apply hand gains in playback: {e}", flush=True)
+
+    # Cache the same master+mimic joint prims for per-tick mimic target updates (if available).
+    try:
+        names = {
+            # masters
+            "thumb_cmc_roll",
+            "thumb_cmc_yaw",
+            "thumb_cmc_pitch",
+            "index_mcp_roll",
+            "index_mcp_pitch",
+            "middle_mcp_pitch",
+            "ring_mcp_roll",
+            "ring_mcp_pitch",
+            "pinky_mcp_roll",
+            "pinky_mcp_pitch",
+            # mimics
+            "index_pip",
+            "index_dip",
+            "middle_pip",
+            "middle_dip",
+            "ring_pip",
+            "ring_dip",
+            "pinky_pip",
+            "pinky_dip",
+            "thumb_mcp",
+            "thumb_ip",
+        }
+        _HAND_PRIMS_REF = loader._collect_named_prims_under(  # type: ignore[attr-defined]  # noqa: SLF001
+            root_prim_path=str(prim_path),
+            names=names,
+        )
+    except Exception:
+        _HAND_PRIMS_REF = None
 
     # Create the hand camera as in the loader (using its defaults).
     attach_prim = loader._find_prim_by_name("xMate3_link6")  # noqa: SLF001
@@ -289,6 +332,16 @@ def main() -> None:
     t = 0
     try:
         while simulation_app.is_running():
+            # Keep mimic joints' targetPosition consistent with masters (if loader helpers exist).
+            if _LOADER_REF is not None and _HAND_PRIMS_REF:
+                try:
+                    _LOADER_REF._update_hand_mimic_targets(  # type: ignore[attr-defined]
+                        root_prim_path=str(args.robot_prim_path),
+                        prims=_HAND_PRIMS_REF,
+                    )
+                except Exception:
+                    pass
+
             # Play one frame per wall tick (simple throttle via accumulation).
             # Using Kit time is overkill here; the dataset fps is low (10Hz).
             s = states[t]
