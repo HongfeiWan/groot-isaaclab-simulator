@@ -159,6 +159,31 @@ def _set_local_pos(prim_path: str, *, pos: tuple[float, float, float]) -> None:
     translate_op.Set(Gf.Vec3d(*pos))
 
 
+def _set_local_pose(
+    prim_path: str,
+    *,
+    pos: tuple[float, float, float],
+    quat_xyzw: tuple[float, float, float, float],
+) -> None:
+    import omni.usd  # type: ignore
+    from pxr import Gf, UsdGeom  # type: ignore
+
+    stage = omni.usd.get_context().get_stage()
+    if stage is None:
+        raise RuntimeError("USD stage is not available.")
+    prim = stage.GetPrimAtPath(prim_path)
+    if prim is None or not prim.IsValid():
+        raise RuntimeError(f"Prim not found: {prim_path}")
+
+    xform = UsdGeom.Xformable(prim)
+    if xform.GetOrderedXformOps():
+        xform.ClearXformOpOrder()
+
+    xform.AddTranslateOp(precision=UsdGeom.XformOp.PrecisionDouble).Set(Gf.Vec3d(*pos))
+    x, y, z, w = quat_xyzw
+    xform.AddOrientOp(precision=UsdGeom.XformOp.PrecisionDouble).Set(Gf.Quatd(w, Gf.Vec3d(x, y, z)))
+
+
 def _load_d405_json(path: str) -> dict:
     p = Path(path).expanduser()
     if not p.exists():
@@ -313,9 +338,13 @@ def main() -> None:
 
     mount_path = f"{attach_prim}/{args.mount_prim_name}"
     _ensure_xform(mount_path)
-    _set_local_pos(mount_path, pos=(0.0, -0.08, 0.0))
+    # Fixed mount pose: translate + rotate around local X (clockwise 10 degrees).
+    theta = math.radians(-10.0)
+    qx = math.sin(theta * 0.5)
+    qw = math.cos(theta * 0.5)
+    _set_local_pose(mount_path, pos=(0.0, -0.08, 0.0), quat_xyzw=(qx, 0.0, 0.0, qw))
     camera_path, box_path = _spawn_camera_and_box(mount_path=mount_path, d405=d405)
-    print(f"Created hand camera mount: {mount_path} (local Y -0.08m)", flush=True)
+    print(f"Created hand camera mount: {mount_path} (local Y -0.08m, roll_x -10deg)", flush=True)
     print(f"Spawned camera prim: {camera_path}", flush=True)
     print(f"Spawned camera body box: {box_path} (0.042 x 0.042 x 0.023 m)", flush=True)
 
