@@ -33,4 +33,17 @@ python ./gr00t/eval/run_gr00t_server.py \
   --eef-body-name panda_hand
 ```
 
+如果要打开摄像头的画面：
+
+```bash
+~/Project/IsaacLab/isaaclab.sh -p ~/Project/Isaac-GR00T/examples/IsaacLab/isaaclab_gr00t_adapter.py \
+  --task Isaac-Lift-Cube-Franka-v0 \
+  --instruction "pick up the cube" \
+  --inject-franka-cameras \
+  --enable_cameras \
+  --robot-asset-name robot \
+  --eef-body-name panda_hand \
+  --viewport-preview
+```
+
 该命令会进入 IsaacLab 仿真环境，加载 `Isaac-Lift-Cube-Franka-v0` 任务，并使用指令 `"pick up the cube"` 开始调用 GR00T 推理服务进行控制。

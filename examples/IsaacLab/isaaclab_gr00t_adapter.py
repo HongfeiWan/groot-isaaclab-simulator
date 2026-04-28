@@ -57,6 +57,11 @@ DROID_EEF_ROTATION_CORRECT = np.array(
     dtype=np.float64,
 )
 
+DEFAULT_EXTERNAL_CAM_POS = (1.0, 0.0, 0.4)
+DEFAULT_EXTERNAL_CAM_ROT = (0.35355, -0.61237, -0.61237, 0.35355)
+DEFAULT_WRIST_CAM_POS = (0.13, 0.0, -0.15)
+DEFAULT_WRIST_CAM_ROT = (-0.70614, 0.03701, 0.03701, -0.70614)
+
 
 def _to_numpy(value: Any) -> np.ndarray:
     """Convert tensors, lists, and arrays into a CPU numpy array."""
@@ -106,6 +111,278 @@ def _resize_one_with_pad(image: Image.Image, height: int, width: int) -> np.ndar
     pad_height = max(0, int((height - resized_height) / 2))
     output.paste(resized_image, (pad_width, pad_height))
     return np.asarray(output)
+
+
+def _parse_floats_csv(value: str | None, *, count: int, name: str) -> tuple[float, ...] | None:
+    if value is None:
+        return None
+    parts = [p.strip() for p in value.split(",") if p.strip()]
+    if len(parts) != count:
+        raise ValueError(f"--{name} expects {count} comma-separated floats, got: {value!r}")
+    return tuple(float(p) for p in parts)
+
+
+class _CameraPreview:
+    def __init__(self, enabled: bool, every: int):
+        self.enabled = bool(enabled)
+        self.every = max(1, int(every))
+        self._backend = None
+        self._cv2 = None
+
+        if not self.enabled:
+            return
+        try:
+            import cv2  # type: ignore
+
+            self._cv2 = cv2
+            self._backend = "cv2"
+        except Exception:
+            self.enabled = False
+            print(
+                "Camera preview disabled: OpenCV (cv2) is not available in this Isaac Lab env. "
+                "Install opencv-python if you want --preview-cameras.",
+                flush=True,
+            )
+
+    def show(self, step: int, *, exterior: np.ndarray, wrist: np.ndarray) -> None:
+        if not self.enabled or (step % self.every != 0):
+            return
+        assert self._backend == "cv2" and self._cv2 is not None
+
+        cv2 = self._cv2
+        # Input is HWC RGB uint8; OpenCV expects BGR for correct colors.
+        ext_bgr = cv2.cvtColor(exterior, cv2.COLOR_RGB2BGR)
+        wrist_bgr = cv2.cvtColor(wrist, cv2.COLOR_RGB2BGR)
+        cv2.imshow("IsaacLab camera: exterior", ext_bgr)
+        cv2.imshow("IsaacLab camera: wrist", wrist_bgr)
+        cv2.waitKey(1)
+
+
+def _maybe_lookup_sensor_prim_path(env: Any, sensor_name: str) -> str | None:
+    """Best-effort resolve a camera sensor's USD prim path."""
+    try:
+        sensor = env.unwrapped.scene[sensor_name]
+    except Exception:
+        return None
+
+    for attr in ("prim_path", "_prim_path", "_sensor_prim_path", "sensor_prim_path"):
+        if hasattr(sensor, attr):
+            value = getattr(sensor, attr)
+            if isinstance(value, str) and value:
+                return value
+
+    cfg = getattr(sensor, "cfg", None)
+    prim_path = getattr(cfg, "prim_path", None) if cfg is not None else None
+    if isinstance(prim_path, str) and prim_path:
+        return prim_path
+    return None
+
+
+def _resolve_stage_prim_path(
+    template_path: str | None, *, env_index: int, suffix_fallback: str | None
+) -> str | None:
+    """Resolve camera prim path to an existing USD prim path.
+
+    Isaac Lab sensor configs often use template paths like `{ENV_REGEX_NS}/...`.
+    Viewports need a concrete prim path that exists in the current USD stage.
+    """
+    if not template_path and not suffix_fallback:
+        return None
+
+    try:
+        import omni.usd  # type: ignore
+    except Exception:
+        return template_path
+
+    stage = omni.usd.get_context().get_stage()
+    if stage is None:
+        return template_path
+
+    candidates: list[str] = []
+    if template_path:
+        expanded = template_path.replace(
+            "{ENV_REGEX_NS}", f"/World/envs/env_{int(env_index)}"
+        ).replace("{ENV_NS}", f"/World/envs/env_{int(env_index)}")
+        candidates.append(expanded)
+        candidates.append(template_path)
+
+    for path in candidates:
+        try:
+            prim = stage.GetPrimAtPath(path)
+        except Exception:
+            prim = None
+        if prim is not None and prim.IsValid():
+            return path
+
+    # Fallback: search by suffix (e.g. "/table_cam" or "/wrist_cam").
+    if suffix_fallback:
+        suffix = suffix_fallback if suffix_fallback.startswith("/") else f"/{suffix_fallback}"
+        try:
+            for prim in stage.Traverse():
+                prim_path = str(prim.GetPath())
+                if prim_path.endswith(suffix):
+                    return prim_path
+        except Exception:
+            return None
+
+    return None
+
+
+class _IsaacSimViewportPreview:
+    """Preview cameras in Isaac Sim viewports (no OpenCV dependency)."""
+
+    def __init__(self, env: Any, args: argparse.Namespace):
+        self.enabled = bool(args.viewport_preview)
+        self._viewports: list[Any] = []
+
+        if not self.enabled:
+            return
+
+        try:
+            from omni.kit.viewport.utility import create_viewport_window  # type: ignore
+        except Exception:
+            self.enabled = False
+            print(
+                "Viewport preview disabled: omni.kit.viewport is not available. "
+                "Make sure you run inside Isaac Sim / IsaacLab.",
+                flush=True,
+            )
+            return
+
+        exterior_path = (
+            _maybe_lookup_sensor_prim_path(env, args.external_camera_sensor)
+            if args.external_camera_sensor
+            else None
+        )
+        wrist_path = (
+            _maybe_lookup_sensor_prim_path(env, args.wrist_camera_sensor)
+            if args.wrist_camera_sensor
+            else None
+        )
+        exterior_path = _resolve_stage_prim_path(
+            exterior_path, env_index=args.viewport_env_index, suffix_fallback="table_cam"
+        )
+        wrist_path = _resolve_stage_prim_path(
+            wrist_path, env_index=args.viewport_env_index, suffix_fallback="wrist_cam"
+        )
+
+        def _get_viewport_api(viewport_window: Any) -> Any | None:
+            """Best-effort unwrap viewport window -> viewport API."""
+            for attr in ("viewport_api", "_viewport_api"):
+                api = getattr(viewport_window, attr, None)
+                if api is not None:
+                    return api
+            getter = getattr(viewport_window, "get_viewport_api", None)
+            if callable(getter):
+                try:
+                    api = getter()
+                except Exception:
+                    api = None
+                if api is not None:
+                    return api
+            return None
+
+        def _set_title(viewport_window: Any, title: str) -> None:
+            for attr in ("window_title", "title", "name"):
+                if hasattr(viewport_window, attr):
+                    try:
+                        setattr(viewport_window, attr, title)
+                        return
+                    except Exception:
+                        pass
+            setter = getattr(viewport_window, "set_window_title", None)
+            if callable(setter):
+                try:
+                    setter(title)
+                except Exception:
+                    pass
+
+        def _bind(viewport_window: Any, camera_path: str, *, title: str) -> bool:
+            """Return True if binding succeeded."""
+            _set_title(viewport_window, title)
+
+            # Some Isaac Sim versions expose camera binding on the window object.
+            for method in ("set_active_camera", "set_active_camera_path", "set_camera_path"):
+                fn = getattr(viewport_window, method, None)
+                if callable(fn):
+                    try:
+                        fn(camera_path)
+                        return True
+                    except Exception:
+                        pass
+
+            # Otherwise try the viewport API object.
+            api = _get_viewport_api(viewport_window)
+            if api is not None:
+                for method in ("set_active_camera", "set_active_camera_path", "set_camera_path"):
+                    fn = getattr(api, method, None)
+                    if callable(fn):
+                        try:
+                            fn(camera_path)
+                            return True
+                        except Exception:
+                            pass
+                # Some variants expose a property.
+                for attr in ("camera_path", "active_camera_path"):
+                    if hasattr(api, attr):
+                        try:
+                            setattr(api, attr, camera_path)
+                            return True
+                        except Exception:
+                            pass
+
+            return False
+
+        if args.viewport_show_exterior and exterior_path:
+            vp = create_viewport_window(
+                window_name="GR00T Exterior Camera",
+                width=args.viewport_width,
+                height=args.viewport_height,
+            )
+            if _bind(vp, exterior_path, title="GR00T Exterior Camera"):
+                self._viewports.append(vp)
+                print(f"Viewport preview bound: exterior -> {exterior_path}", flush=True)
+            else:
+                print(
+                    "Viewport preview: could not bind exterior camera to viewport (API mismatch).",
+                    flush=True,
+                )
+        elif args.viewport_show_exterior:
+            print(
+                "Viewport preview: exterior camera prim path not found; skipping exterior viewport.",
+                flush=True,
+            )
+
+        if args.viewport_show_wrist and wrist_path:
+            vp = create_viewport_window(
+                window_name="GR00T Wrist Camera",
+                width=args.viewport_width,
+                height=args.viewport_height,
+            )
+            if _bind(vp, wrist_path, title="GR00T Wrist Camera"):
+                self._viewports.append(vp)
+                print(f"Viewport preview bound: wrist -> {wrist_path}", flush=True)
+            else:
+                print(
+                    "Viewport preview: could not bind wrist camera to viewport (API mismatch).",
+                    flush=True,
+                )
+        elif args.viewport_show_wrist:
+            print(
+                "Viewport preview: wrist camera prim path not found; skipping wrist viewport.",
+                flush=True,
+            )
+
+        if not self._viewports:
+            print(
+                "Viewport preview requested, but no cameras could be bound. "
+                "Ensure cameras are enabled and sensor names match.",
+                flush=True,
+            )
+
+    def close(self) -> None:
+        # Viewport windows are owned by Isaac Sim UI; allow them to be GC'd.
+        self._viewports.clear()
 
 
 def _as_hwc_uint8(value: Any, *, image_size: tuple[int, int]) -> np.ndarray:
@@ -205,6 +482,8 @@ class IsaacLabGr00tAdapter:
         self.frame_buffer: deque[dict[str, np.ndarray]] = deque(maxlen=self.video_history_len)
         self.action_chunk: np.ndarray | None = None
         self.action_index = 0
+        self.preview = _CameraPreview(args.preview_cameras, args.preview_every)
+        self.viewport_preview = _IsaacSimViewportPreview(env, args)
 
         print("Connected to GR00T policy server.")
         self._print_modality_config()
@@ -220,6 +499,8 @@ class IsaacLabGr00tAdapter:
     def build_observation(self, env_obs: Any) -> dict[str, Any]:
         exterior_image, wrist_image = self._extract_images(env_obs)
         self.frame_buffer.append({"exterior": exterior_image, "wrist": wrist_image})
+        # Use the caller's step counter for stable preview timing.
+        # (The frame buffer index depends on modality history and resets.)
 
         video_dict = self._build_video_dict()
         state_dict = self._build_state_dict(env_obs)
@@ -479,6 +760,69 @@ def _add_gr00t_args(parser: argparse.ArgumentParser) -> None:
             "gym.make(). Use with Isaac Lab's --enable_cameras flag."
         ),
     )
+    parser.add_argument(
+        "--external-cam-offset-pos",
+        type=str,
+        default=None,
+        help='Override table camera offset position as "x,y,z" (meters).',
+    )
+    parser.add_argument(
+        "--external-cam-offset-rot",
+        type=str,
+        default=None,
+        help='Override table camera offset quaternion as "x,y,z,w" (ros convention).',
+    )
+    parser.add_argument(
+        "--wrist-cam-offset-pos",
+        type=str,
+        default=None,
+        help='Override wrist camera offset position as "x,y,z" (meters).',
+    )
+    parser.add_argument(
+        "--wrist-cam-offset-rot",
+        type=str,
+        default=None,
+        help='Override wrist camera offset quaternion as "x,y,z,w" (ros convention).',
+    )
+    parser.add_argument(
+        "--preview-cameras",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Show real-time camera RGB frames in local windows (requires opencv-python).",
+    )
+    parser.add_argument(
+        "--preview-every",
+        type=int,
+        default=1,
+        help="Preview every N env steps (only used when --preview-cameras).",
+    )
+
+    parser.add_argument(
+        "--viewport-preview",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Show camera feeds using Isaac Sim viewport windows (no OpenCV needed).",
+    )
+    parser.add_argument(
+        "--viewport-show-exterior",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When --viewport-preview, show the exterior/table camera viewport.",
+    )
+    parser.add_argument(
+        "--viewport-show-wrist",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When --viewport-preview, show the wrist camera viewport.",
+    )
+    parser.add_argument("--viewport-width", type=int, default=640)
+    parser.add_argument("--viewport-height", type=int, default=360)
+    parser.add_argument(
+        "--viewport-env-index",
+        type=int,
+        default=0,
+        help="When resolving {ENV_REGEX_NS} camera prim paths, use env_{index}.",
+    )
 
     parser.add_argument("--external-image-key", type=str, default=None)
     parser.add_argument("--wrist-image-key", type=str, default=None)
@@ -550,6 +894,23 @@ def _inject_franka_cameras(env_cfg: Any, args: argparse.Namespace) -> None:
     args.external_camera_sensor = external_name
     args.wrist_camera_sensor = wrist_name
 
+    external_pos = (
+        _parse_floats_csv(args.external_cam_offset_pos, count=3, name="external-cam-offset-pos")
+        or DEFAULT_EXTERNAL_CAM_POS
+    )
+    external_rot = (
+        _parse_floats_csv(args.external_cam_offset_rot, count=4, name="external-cam-offset-rot")
+        or DEFAULT_EXTERNAL_CAM_ROT
+    )
+    wrist_pos = (
+        _parse_floats_csv(args.wrist_cam_offset_pos, count=3, name="wrist-cam-offset-pos")
+        or DEFAULT_WRIST_CAM_POS
+    )
+    wrist_rot = (
+        _parse_floats_csv(args.wrist_cam_offset_rot, count=4, name="wrist-cam-offset-rot")
+        or DEFAULT_WRIST_CAM_ROT
+    )
+
     setattr(
         env_cfg.scene,
         external_name,
@@ -566,8 +927,8 @@ def _inject_franka_cameras(env_cfg: Any, args: argparse.Namespace) -> None:
                 clipping_range=(0.1, 10.0),
             ),
             offset=CameraCfg.OffsetCfg(
-                pos=(1.0, 0.0, 0.4),
-                rot=(0.35355, -0.61237, -0.61237, 0.35355),
+                pos=external_pos,
+                rot=external_rot,
                 convention="ros",
             ),
         ),
@@ -588,8 +949,8 @@ def _inject_franka_cameras(env_cfg: Any, args: argparse.Namespace) -> None:
                 clipping_range=(0.1, 2.0),
             ),
             offset=CameraCfg.OffsetCfg(
-                pos=(0.13, 0.0, -0.15),
-                rot=(-0.70614, 0.03701, 0.03701, -0.70614),
+                pos=wrist_pos,
+                rot=wrist_rot,
                 convention="ros",
             ),
         ),
@@ -599,9 +960,14 @@ def _inject_franka_cameras(env_cfg: Any, args: argparse.Namespace) -> None:
     if hasattr(env_cfg, "sim") and hasattr(env_cfg.sim, "render"):
         env_cfg.sim.render.antialiasing_mode = "DLAA"
 
+    print("Injected Franka cameras into env cfg:", flush=True)
+    print(f"  external sensor='{external_name}' prim_path={{ENV_REGEX_NS}}/table_cam", flush=True)
+    print(f"    offset.pos={external_pos} offset.rot={external_rot} convention=ros", flush=True)
     print(
-        f"Injected Franka cameras into env cfg: external='{external_name}', wrist='{wrist_name}'."
+        f"  wrist sensor='{wrist_name}' prim_path={{ENV_REGEX_NS}}/Robot/panda_hand/wrist_cam",
+        flush=True,
     )
+    print(f"    offset.pos={wrist_pos} offset.rot={wrist_rot} convention=ros", flush=True)
 
 
 def _make_env(args: argparse.Namespace) -> Any:
@@ -656,6 +1022,14 @@ def main() -> None:
     env_obs = _unwrap_reset(env.reset())
     try:
         for step in range(args.max_steps):
+            # Optional camera preview (real-time RGB).
+            try:
+                exterior_image, wrist_image = adapter._extract_images(env_obs)
+                adapter.preview.show(step, exterior=exterior_image, wrist=wrist_image)
+            except Exception:
+                # Preview is best-effort; do not break control loop.
+                pass
+
             env_action_np = adapter.get_env_action(env_obs, step)
             env_action = torch.tensor(
                 env_action_np,
@@ -671,6 +1045,7 @@ def main() -> None:
                 adapter.action_index = 0
     finally:
         env.close()
+        adapter.viewport_preview.close()
         simulation_app.close()
 
 
