@@ -61,6 +61,7 @@ DEFAULT_IMAGE_SIZE = (180, 320)
 DEFAULT_CUBE_POS = (-0.5, -0.5, 0.6)
 DEFAULT_CUBE_SIZE = 0.055
 DEFAULT_TABLE_TOP_Z = DEFAULT_CUBE_POS[2] - DEFAULT_CUBE_SIZE * 0.5
+DEFAULT_INITIAL_EEF_XYZ = (-0.7, -0.3, 0.6)
 
 WORLD_REF = None
 LOADER_REF = None
@@ -193,7 +194,9 @@ def _spawn_cube(*, prim_path: str, position: np.ndarray, size: float, mass: floa
     PhysxSchema.PhysxRigidBodyAPI.Apply(prim).CreateDisableGravityAttr(False)
 
 
-def _spawn_table_if_requested(*, enabled: bool, center_xy: np.ndarray, top_z: float) -> None:
+def _spawn_table_if_requested(
+    *, enabled: bool, center_xy: np.ndarray, top_z: float, table_xy_size: float
+) -> None:
     if not enabled:
         return
 
@@ -216,7 +219,7 @@ def _spawn_table_if_requested(*, enabled: bool, center_xy: np.ndarray, top_z: fl
         Gf.Vec3d(float(center_xy[0]), float(center_xy[1]), float(top_z) - table_height * 0.5)
     )
     xform.AddScaleOp(precision=UsdGeom.XformOp.PrecisionDouble).Set(
-        Gf.Vec3d(0.55, 0.45, table_height)
+        Gf.Vec3d(float(table_xy_size), float(table_xy_size), table_height)
     )
     UsdPhysics.CollisionAPI.Apply(stage.GetPrimAtPath(table_path))
 
@@ -452,15 +455,44 @@ class XmateL10ActionExecutor:
         self.args = args
         self.teleop = _load_teleop_module()
 
-        self.q_cmd = _parse_vector(str(args.initial_arm_q), 6, name="--initial-arm-q")
+        q_seed = _parse_vector(str(args.initial_arm_q), 6, name="--initial-arm-q")
+        seed_pose = self.ik.fk6(q_seed)
+        self.target_xyz = np.asarray(args.initial_eef_xyz, dtype=np.float64).reshape(3).copy()
+        self.target_rotation = seed_pose[:3, :3].copy()
+        try:
+            initial_pose = self.pose_from_xyz_rotation(self.target_xyz, self.target_rotation)
+            self.q_cmd = self.ik.solve6(initial_pose, q_seed, psi=float(self.args.psi))
+            reached_xyz = self.ik.fk6(self.q_cmd)[:3, 3]
+            print(
+                f"[init] IK initialized EEF target={self.target_xyz.tolist()} "
+                f"reached={reached_xyz.tolist()} q={self.q_cmd.tolist()}",
+                flush=True,
+            )
+        except Exception as exc:
+            self.q_cmd = q_seed
+            self.target_xyz = seed_pose[:3, 3].copy()
+            print(
+                f"[warn] Initial EEF IK failed; using --initial-arm-q instead: {exc}",
+                flush=True,
+            )
         self.hand_q = self.teleop.HAND_OPEN_Q.copy()
         self.hand_alpha = 0.0
         self.target_pose = self.ik.fk6(self.q_cmd)
-        self.target_xyz = self.target_pose[:3, 3].copy()
         self.target_rotation = self.target_pose[:3, :3].copy()
         self.last_action_keys: tuple[str, ...] = ()
 
+        self.force_apply_current_targets()
+
+    def current_arm_q(self) -> np.ndarray:
+        return self.teleop._current_arm_q(self.robot, self.arm_indices, self.q_cmd)  # noqa: SLF001
+
+    def current_eef_pose(self) -> np.ndarray:
+        return self.ik.fk6(self.current_arm_q())
+
+    def force_apply_current_targets(self) -> None:
+        self._force_joint_positions(self.arm_indices, self.q_cmd)
         self.teleop._apply_joint_positions(self.robot, self.arm_indices, self.q_cmd)  # noqa: SLF001
+        self._force_joint_positions(self.hand_indices, self.hand_q)
         self.teleop._apply_l10_hand_positions(  # noqa: SLF001
             self.robot,
             self.hand_indices,
@@ -468,11 +500,26 @@ class XmateL10ActionExecutor:
             self.hand_q,
         )
 
-    def current_arm_q(self) -> np.ndarray:
-        return self.teleop._current_arm_q(self.robot, self.arm_indices, self.q_cmd)  # noqa: SLF001
-
-    def current_eef_pose(self) -> np.ndarray:
-        return self.ik.fk6(self.current_arm_q())
+    def _force_joint_positions(self, joint_indices: np.ndarray, q: np.ndarray) -> None:
+        if joint_indices.size == 0:
+            return
+        values = np.asarray(q, dtype=np.float32)[: joint_indices.size]
+        indices = np.asarray(joint_indices, dtype=np.int32)
+        for method_name in ("set_joint_positions", "set_joint_position_targets"):
+            method = getattr(self.robot, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                method(values, joint_indices=indices)
+                continue
+            except TypeError:
+                pass
+            except Exception:
+                continue
+            try:
+                method(positions=values, joint_indices=indices)
+            except Exception:
+                continue
 
     def step_action(self, action: dict[str, np.ndarray], action_index: int) -> None:
         self.last_action_keys = tuple(sorted(action.keys()))
@@ -625,6 +672,63 @@ def _step_simulation(simulation_app: Any, *, use_world_step: bool = False) -> No
     simulation_app.update()
 
 
+def _get_timeline_interface() -> Any | None:
+    try:
+        import omni.timeline  # type: ignore
+
+        return omni.timeline.get_timeline_interface()
+    except Exception:
+        return None
+
+
+def _pause_timeline() -> bool:
+    timeline = _get_timeline_interface()
+    if timeline is None:
+        return False
+    try:
+        timeline.pause()
+        return True
+    except Exception:
+        try:
+            timeline.stop()
+            return True
+        except Exception:
+            return False
+
+
+def _timeline_is_playing() -> bool:
+    timeline = _get_timeline_interface()
+    if timeline is None:
+        return True
+    try:
+        return bool(timeline.is_playing())
+    except Exception:
+        return True
+
+
+def _wait_for_play_if_requested(args: argparse.Namespace, simulation_app: Any) -> None:
+    if not bool(args.start_paused):
+        return
+    if bool(getattr(args, "headless", False)):
+        print("[paused] --start-paused ignored in headless mode.", flush=True)
+        return
+
+    if _pause_timeline():
+        print(
+            "[paused] Scene is ready. Press Play in Isaac Sim to start GR00T control.", flush=True
+        )
+    else:
+        print("[warn] Could not pause Isaac Sim timeline; starting immediately.", flush=True)
+        return
+
+    while simulation_app.is_running() and not _timeline_is_playing():
+        _update_loader_helpers(args)
+        simulation_app.update()
+        time.sleep(0.05)
+
+    print("[paused] Isaac Sim timeline is playing; starting policy loop.", flush=True)
+
+
 def _spawn_cameras(loader: Any, args: argparse.Namespace) -> tuple[str, str]:
     d405 = None
     try:
@@ -682,6 +786,7 @@ def _init_scene(args: argparse.Namespace) -> tuple["SingleArticulation", dict[st
         enabled=bool(args.spawn_table),
         center_xy=np.asarray(args.cube_position[:2], dtype=np.float64),
         top_z=float(args.table_top_z),
+        table_xy_size=float(args.cube_size),
     )
     _spawn_cube(
         prim_path=str(args.cube_prim_path),
@@ -742,6 +847,30 @@ def _update_loader_helpers(args: argparse.Namespace) -> None:
         pass
 
 
+def _settle_initial_pose(
+    executor: XmateL10ActionExecutor,
+    args: argparse.Namespace,
+    simulation_app: Any,
+) -> None:
+    frames = max(0, int(args.initial_settle_frames))
+    if frames <= 0:
+        return
+    print(
+        f"[init] forcing initial EEF pose for {frames} frames before policy start...",
+        flush=True,
+    )
+    for i in range(frames):
+        executor.force_apply_current_targets()
+        _update_loader_helpers(args)
+        _step_simulation(simulation_app, use_world_step=bool(args.world_step))
+        eef_xyz = executor.current_eef_pose()[:3, 3]
+        print(
+            f"[init] settle {i + 1}/{frames}: eef_xyz={eef_xyz.tolist()} "
+            f"target={executor.target_xyz.tolist()}",
+            flush=True,
+        )
+
+
 def _print_modality_config(modality_config: dict[str, Any]) -> None:
     print("\nGR00T modality config", flush=True)
     for modality, config in modality_config.items():
@@ -773,9 +902,15 @@ def _add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--policy-api-token", type=str, default=None)
     parser.add_argument("--policy-timeout-ms", type=int, default=120000)
     parser.add_argument("--instruction", type=str, default="pick up the cube")
-    parser.add_argument("--max-steps", type=int, default=600)
+    parser.add_argument("--max-steps", type=int, default=6000)
     parser.add_argument("--replan-horizon", type=int, default=1)
     parser.add_argument("--print-every", type=int, default=1)
+    parser.add_argument(
+        "--start-paused",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Pause after scene setup and wait for Play before starting GR00T control.",
+    )
     parser.add_argument(
         "--camera-warmup-frames",
         type=int,
@@ -821,6 +956,19 @@ def _add_args(parser: argparse.ArgumentParser) -> None:
         "--initial-arm-q",
         type=str,
         default="0.0,-0.45,0.8,0.0,0.55,0.0",
+        help="IK seed and default orientation source for the initial EEF target.",
+    )
+    parser.add_argument(
+        "--initial-eef-xyz",
+        type=str,
+        default=",".join(str(v) for v in DEFAULT_INITIAL_EEF_XYZ),
+        help="Initial EEF XYZ target solved with IK before GR00T control starts.",
+    )
+    parser.add_argument(
+        "--initial-settle-frames",
+        type=int,
+        default=8,
+        help="Force the initial IK joint pose for this many rendered frames before policy starts.",
     )
     parser.add_argument("--command-hz", type=float, default=20.0)
     parser.add_argument("--max-joint-step", type=float, default=0.045)
@@ -866,6 +1014,7 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
     AppLauncher.add_app_launcher_args(parser)
     args = parser.parse_args()
     args.cube_position = _parse_vector(str(args.cube_position), 3, name="--cube-position")
+    args.initial_eef_xyz = _parse_vector(str(args.initial_eef_xyz), 3, name="--initial-eef-xyz")
     args.workspace_min = _parse_vector(str(args.workspace_min), 3, name="--workspace-min")
     args.workspace_max = _parse_vector(str(args.workspace_max), 3, name="--workspace-max")
     app_launcher = AppLauncher(args)
@@ -917,6 +1066,7 @@ def main() -> None:
             hand_indices=hand_indices,
             args=args,
         )
+        _settle_initial_pose(executor, args, simulation_app)
 
         image_size = (int(args.image_height), int(args.image_width))
         exterior_reader = CameraReader(fixed_camera_path, image_size=image_size, name="fixed")
@@ -944,6 +1094,7 @@ def main() -> None:
             f"instruction={args.instruction!r}",
             flush=True,
         )
+        _wait_for_play_if_requested(args, simulation_app)
 
         action_chunk: dict[str, np.ndarray] | None = None
         action_index = 0
