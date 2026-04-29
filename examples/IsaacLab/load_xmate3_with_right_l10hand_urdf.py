@@ -22,6 +22,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 COMBINED_URDF_PATH = REPO_ROOT / "demo_data" / "l10_hand" / "xMate3_with_right_L10hand.urdf"
 D405_JSON_PATH = REPO_ROOT / "d405json.json"
+RSD455_USD_RELATIVE_PATH = "Isaac/Sensors/Intel/RealSense/rsd455.usd"
 
 # Hand joint drive gains: (stiffness, damping)
 GAINS: dict[str, tuple[float, float]] = {
@@ -229,6 +230,126 @@ def _apply_d405_params_to_usd_camera(camera, d405: dict) -> None:
     camera.CreateClippingRangeAttr(Gf.Vec2f(clip_near, clip_far))
 
 
+def _apply_d455_fallback_params_to_usd_camera(camera) -> None:
+    """Apply D455-like camera params when the Isaac Sim D455 USD asset is unavailable."""
+    from pxr import Gf  # type: ignore
+
+    # Match the D455-like Isaac parameters used elsewhere in this script family.
+    focal_m = 0.00193
+    hfov_deg = 87.0
+    vfov_deg = 58.0
+    focal_cm = focal_m * 100.0
+    horiz_aperture_cm = 2.0 * focal_m * math.tan(math.radians(hfov_deg) * 0.5) * 100.0
+    vert_aperture_cm = 2.0 * focal_m * math.tan(math.radians(vfov_deg) * 0.5) * 100.0
+
+    camera.CreateFocalLengthAttr(float(focal_cm))
+    camera.CreateHorizontalApertureAttr(float(horiz_aperture_cm))
+    camera.CreateVerticalApertureAttr(float(vert_aperture_cm))
+    camera.CreateFStopAttr(2.0)
+    camera.CreateFocusDistanceAttr(0.4)
+    camera.CreateClippingRangeAttr(Gf.Vec2f(0.07, 10.0))
+
+
+def _get_isaac_assets_root_path() -> str | None:
+    for module_name in (
+        "isaacsim.core.utils.nucleus",
+        "omni.isaac.core.utils.nucleus",
+    ):
+        try:
+            module = __import__(module_name, fromlist=["get_assets_root_path"])
+            root = module.get_assets_root_path()
+        except Exception:
+            continue
+        if root:
+            return str(root).rstrip("/")
+    return None
+
+
+def _rsd455_usd_candidates() -> list[str]:
+    candidates: list[str] = []
+    assets_root = _get_isaac_assets_root_path()
+    if assets_root:
+        candidates.append(f"{assets_root}/{RSD455_USD_RELATIVE_PATH}")
+
+    candidates.extend(
+        [
+            f"omniverse://localhost/NVIDIA/Assets/Isaac/5.1/{RSD455_USD_RELATIVE_PATH}",
+            f"omniverse://localhost/NVIDIA/Assets/Isaac/5.0/{RSD455_USD_RELATIVE_PATH}",
+            f"omniverse://localhost/NVIDIA/Assets/Isaac/4.5/{RSD455_USD_RELATIVE_PATH}",
+        ]
+    )
+
+    unique_candidates: list[str] = []
+    for candidate in candidates:
+        if candidate not in unique_candidates:
+            unique_candidates.append(candidate)
+    return unique_candidates
+
+
+def _usd_asset_exists(asset_path: str) -> bool:
+    if "://" not in asset_path:
+        return Path(asset_path).expanduser().exists()
+
+    try:
+        import omni.client  # type: ignore
+
+        result, _ = omni.client.stat(asset_path)
+        return result == omni.client.Result.OK
+    except Exception:
+        # Some Isaac Sim installs do not expose omni.client before the app is fully initialized.
+        # Let USD try the reference in that case.
+        return True
+
+
+def _try_reference_rsd455_usd(prim_path: str) -> str | None:
+    import omni.usd  # type: ignore
+    from pxr import UsdGeom  # type: ignore
+
+    stage = omni.usd.get_context().get_stage()
+    if stage is None:
+        raise RuntimeError("USD stage is not available.")
+
+    prim = UsdGeom.Xform.Define(stage, prim_path).GetPrim()
+    for asset_path in _rsd455_usd_candidates():
+        if not _usd_asset_exists(asset_path):
+            continue
+        try:
+            prim.GetReferences().ClearReferences()
+            prim.GetReferences().AddReference(asset_path)
+            print(f"[fixed_camera] referenced D455 USD: {asset_path}", flush=True)
+            return asset_path
+        except Exception as e:
+            print(f"[warn] Failed to reference D455 USD '{asset_path}': {e}", flush=True)
+
+    print("[warn] Could not find/reference rsd455.usd; falling back to box + manual D455 camera.", flush=True)
+    return None
+
+
+def _find_first_camera_under(root_prim_path: str) -> str | None:
+    import omni.usd  # type: ignore
+    from pxr import UsdGeom  # type: ignore
+
+    stage = omni.usd.get_context().get_stage()
+    if stage is None:
+        return None
+
+    root = stage.GetPrimAtPath(root_prim_path)
+    if not root or not root.IsValid():
+        return None
+
+    root_prefix = str(root.GetPath())
+    if not root_prefix.endswith("/"):
+        root_prefix = root_prefix + "/"
+
+    for prim in stage.Traverse():
+        prim_path = str(prim.GetPath())
+        if prim_path != str(root.GetPath()) and not prim_path.startswith(root_prefix):
+            continue
+        if prim.IsA(UsdGeom.Camera):
+            return prim_path
+    return None
+
+
 def _spawn_camera_and_box(*, mount_path: str, d405: dict | None) -> tuple[str, str]:
     """Spawn a USD Camera prim and a small box mesh under the mount.
 
@@ -274,10 +395,106 @@ def _spawn_camera_and_box(*, mount_path: str, d405: dict | None) -> tuple[str, s
     return camera_path, box_path
 
 
+def _spawn_fixed_world_camera_with_box() -> tuple[str, str, str]:
+    """Spawn a world-fixed D455 camera and its visible body.
+
+    Camera rig pose in world:
+        x=0.1, y=-0.3, z=0.6 (meters) on ``fixed_camera_rig``; child ``fixed_camera_rig/yaw``
+        applies RotateXYZ=(180, 135, 0) deg for IsaacLab. Box and camera live
+        under ``yaw`` so they share the same rotation without ambiguous translate/rotate op order.
+    Camera body:
+        Prefer Isaac Sim's D455 asset ``rsd455.usd``. If unavailable, fall back
+        to a 124 mm x 29 mm x 26 mm proxy box, with thickness(26 mm) along +X
+        and 124 mm along +Y: scale (x, y, z) = (0.026, 0.124, 0.029) m.
+    Camera pose relative to body center:
+        after yaw, move 0.013 m along body local -X to lie on the box surface,
+        looking toward body local -X.
+    Image axes vs box (rig-aligned) axes:
+        image +u (horizontal) -> box +Y; image +v (vertical) -> box +Z.
+
+    Returns:
+        (rig_prim_path, camera_prim_path, box_prim_path)
+    """
+    import omni.usd  # type: ignore
+    from pxr import Gf, UsdGeom  # type: ignore
+
+    stage = omni.usd.get_context().get_stage()
+    if stage is None:
+        raise RuntimeError("USD stage is not available.")
+
+    rig_path = "/World/fixed_camera_rig"
+    # Split translate vs rotation so the rig pivots at its world position.
+    yaw_path = f"{rig_path}/yaw"
+    body_path = f"{yaw_path}/rsd455"
+    camera_offset_path = f"{yaw_path}/camera_offset"
+    camera_frame_path = f"{camera_offset_path}/camera_frame"
+    camera_path = f"{camera_frame_path}/camera"
+
+    UsdGeom.Xform.Define(stage, rig_path)
+    _set_local_pos(rig_path, pos=(0.1, -0.3, 0.6))
+
+    UsdGeom.Xform.Define(stage, yaw_path)
+    yaw_xform = UsdGeom.Xformable(stage.GetPrimAtPath(yaw_path))
+    if yaw_xform.GetOrderedXformOps():
+        yaw_xform.ClearXformOpOrder()
+    rig_rotation_xyz_deg = Gf.Vec3d(180.0, 135.0, 0.0)
+    yaw_xform.AddRotateXYZOp(precision=UsdGeom.XformOp.PrecisionDouble).Set(rig_rotation_xyz_deg)
+
+    referenced_d455_usd = _try_reference_rsd455_usd(body_path)
+    asset_camera_path = _find_first_camera_under(body_path) if referenced_d455_usd is not None else None
+    if asset_camera_path is not None:
+        print(f"[fixed_camera] using D455 USD camera prim: {asset_camera_path}", flush=True)
+        return rig_path, asset_camera_path, body_path
+
+    if referenced_d455_usd is not None:
+        print("[warn] D455 USD referenced but no Camera prim was found; creating manual D455 camera.", flush=True)
+    else:
+        # Visible fallback body proxy.
+        body = UsdGeom.Cube.Define(stage, body_path)
+        body.CreateSizeAttr(1.0)
+        body_xform = UsdGeom.Xformable(stage.GetPrimAtPath(body_path))
+        if body_xform.GetOrderedXformOps():
+            body_xform.ClearXformOpOrder()
+        body_xform.AddScaleOp(precision=UsdGeom.XformOp.PrecisionDouble).Set(
+            Gf.Vec3d(0.026, 0.124, 0.029)
+        )
+
+    # USD camera: +X is image right, +Y is image up, view is -Z.
+    # Map camera -> rig: +X_cam -> +Y_box, +Y_cam -> +Z_box, +Z_cam -> +X_box
+    # so -Z_cam -> -X_box and image u,v align with box Y,Z.
+    # Same transform as matrix [[0,0,1],[1,0,0],[0,1,0]]; pxr may not expose
+    # Gf.Rotation(Matrix3d), so use axis-angle: +120 deg about (1,1,1)/sqrt(3).
+    inv_sqrt3 = 1.0 / math.sqrt(3.0)
+    cam_axis = Gf.Vec3d(inv_sqrt3, inv_sqrt3, inv_sqrt3)
+    cam_orient = Gf.Rotation(cam_axis, 120.0).GetQuat()
+    # Offset and orientation are intentionally split:
+    # - camera_offset translates along the already-yawed body -X axis to the box surface.
+    # - camera_frame only orients the optical frame, so the offset is not affected by it.
+    UsdGeom.Xform.Define(stage, camera_offset_path)
+    camera_offset = UsdGeom.Xformable(stage.GetPrimAtPath(camera_offset_path))
+    if camera_offset.GetOrderedXformOps():
+        camera_offset.ClearXformOpOrder()
+    camera_offset.AddTranslateOp(precision=UsdGeom.XformOp.PrecisionDouble).Set(Gf.Vec3d(-0.013, 0.0, 0.0))
+
+    UsdGeom.Xform.Define(stage, camera_frame_path)
+    camera_frame = UsdGeom.Xformable(stage.GetPrimAtPath(camera_frame_path))
+    if camera_frame.GetOrderedXformOps():
+        camera_frame.ClearXformOpOrder()
+    camera_frame.AddOrientOp(precision=UsdGeom.XformOp.PrecisionDouble).Set(cam_orient)
+
+    camera = UsdGeom.Camera.Define(stage, camera_path)
+    _apply_d455_fallback_params_to_usd_camera(camera)
+
+    return rig_path, camera_path, body_path
+
+
 def _open_camera_viewport_window(camera_prim_path: str) -> None:
     """Open a viewport window and set its active camera."""
     try:
-        from omni.kit.viewport.utility import create_viewport_window, get_active_viewport  # type: ignore
+        from omni.kit.viewport.utility import (  # type: ignore
+            create_viewport_window,
+            get_active_viewport,
+        )
     except Exception as e:
         print(f"[warn] viewport utilities not available; cannot open camera window: {e}", flush=True)
         return
@@ -547,6 +764,18 @@ def main() -> None:
     print(f"Created hand camera mount: {mount_path} (local Y -0.08m, roll_x -10deg)", flush=True)
     print(f"Spawned camera prim: {camera_path}", flush=True)
     print(f"Spawned camera body box: {box_path} (0.042 x 0.042 x 0.023 m)", flush=True)
+
+    fixed_rig_path, fixed_camera_path, fixed_box_path = _spawn_fixed_world_camera_with_box()
+    print(
+        f"Spawned fixed world camera rig: {fixed_rig_path} + {fixed_rig_path}/yaw "
+        f"(x=0.1, y=-0.3, z=0.6 m, RotateXYZ = 180, 135, 0 deg)",
+        flush=True,
+    )
+    print(f"Spawned fixed world camera prim: {fixed_camera_path} (look dir: -X)", flush=True)
+    print(
+        f"Spawned fixed world D455 body/visual prim: {fixed_box_path}",
+        flush=True,
+    )
 
     # Show the hand camera view in a dedicated viewport window (requires cameras enabled).
     if bool(args.show_hand_camera) and not bool(getattr(args, "headless", False)):
