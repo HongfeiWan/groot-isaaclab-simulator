@@ -38,6 +38,7 @@ LOADER_SCRIPT_PATH = REPO_ROOT / "examples" / "IsaacLab" / "load_xmate3_with_rig
 _WORLD_REF = None
 _LOADER_REF = None
 _HAND_PRIMS_REF = None
+_CAMERA_PRIMS_REF = {}
 
 
 def _parse_args() -> tuple[argparse.Namespace, object]:
@@ -136,9 +137,79 @@ def _import_loader_module():
     return module
 
 
+def _spawn_playback_cameras(loader, *, prim_path: str) -> None:
+    """Create the same camera rigs as the loader after articulation initialization."""
+    global _CAMERA_PRIMS_REF
+
+    # Create the hand camera as in the loader (using its defaults).
+    attach_prim = loader._find_prim_by_name("xMate3_link6")  # noqa: SLF001
+    if not attach_prim:
+        for candidate in ("base_link", "xMate3_base_link", "world", "xMate3_link0"):
+            attach_prim = loader._find_prim_by_name(candidate)  # noqa: SLF001
+            if attach_prim:
+                break
+    if attach_prim:
+        mount_path = f"{attach_prim}/hand_camera_mount"
+        loader._ensure_xform(mount_path)  # noqa: SLF001
+        # Keep mount pose consistent with the loader's current fixed pose.
+        theta = loader.math.radians(-10.0)  # noqa: SLF001
+        qx = loader.math.sin(theta * 0.5)  # noqa: SLF001
+        qw = loader.math.cos(theta * 0.5)  # noqa: SLF001
+        loader._set_local_pose(  # noqa: SLF001
+            mount_path,
+            pos=(0.0, -0.08, 0.0),
+            quat_xyzw=(qx, 0.0, 0.0, qw),
+        )
+        d405 = None
+        try:
+            d405 = loader._load_d405_json(str(loader.D405_JSON_PATH))  # noqa: SLF001
+        except Exception:
+            d405 = None
+        camera_path, _ = loader._spawn_camera_and_box(mount_path=mount_path, d405=d405)  # noqa: SLF001
+        _CAMERA_PRIMS_REF["hand_camera"] = camera_path
+        print(f"[playback_camera] hand camera prim: {camera_path}", flush=True)
+    else:
+        print(f"[warn] playback camera attach link not found under {prim_path}", flush=True)
+
+    # Create the fixed D455/head-style camera as in the loader. This is the view that matches
+    # the dataset's realsense_head -> ego_view convention.
+    try:
+        fixed_rig_path, fixed_camera_path, fixed_box_path = (
+            loader._spawn_fixed_world_camera_with_box()  # noqa: SLF001
+        )
+        _CAMERA_PRIMS_REF["fixed_camera"] = fixed_camera_path
+        print(
+            f"[playback_camera] fixed camera rig: {fixed_rig_path}; "
+            f"camera prim: {fixed_camera_path}; body prim: {fixed_box_path}",
+            flush=True,
+        )
+        if not bool(getattr(loader, "_UI_REFS", [])) and not bool(getattr(loader, "_headless", False)):
+            try:
+                loader._open_camera_viewport_window(  # noqa: SLF001
+                    fixed_camera_path,
+                    title="Fixed D455 Camera",
+                )
+            except TypeError:
+                loader._open_camera_viewport_window(fixed_camera_path)  # noqa: SLF001
+    except Exception as e:
+        print(f"[warn] failed to spawn fixed camera in playback: {e}", flush=True)
+
+    try:
+        import omni.usd  # type: ignore
+        from pxr import UsdGeom  # type: ignore
+
+        stage = omni.usd.get_context().get_stage()
+        camera_prims = [
+            str(prim.GetPath()) for prim in stage.Traverse() if prim.IsA(UsdGeom.Camera)
+        ]
+        print(f"[playback_camera] stage camera prims: {camera_prims}", flush=True)
+    except Exception as e:
+        print(f"[warn] failed to list playback cameras: {e}", flush=True)
+
+
 def _init_robot_scene(*, prim_path: str) -> "SingleArticulation":
-    # Reuse the existing loader script to build the stage (URDF import + camera mount + viewport window).
-    global _LOADER_REF, _HAND_PRIMS_REF
+    # Reuse the existing loader script to build the stage and camera rigs.
+    global _LOADER_REF, _HAND_PRIMS_REF, _CAMERA_PRIMS_REF
     loader = _import_loader_module()
     _LOADER_REF = loader
 
@@ -154,6 +225,10 @@ def _init_robot_scene(*, prim_path: str) -> "SingleArticulation":
         _WORLD_REF.reset()
 
     loader._add_ground_plane()  # noqa: SLF001
+    try:
+        loader._add_scene_light()  # type: ignore[attr-defined]  # noqa: SLF001
+    except Exception:
+        pass
     loader._import_urdf(  # noqa: SLF001
         urdf_path=str(loader.COMBINED_URDF_PATH),
         prim_path=prim_path,
@@ -206,34 +281,6 @@ def _init_robot_scene(*, prim_path: str) -> "SingleArticulation":
     except Exception:
         _HAND_PRIMS_REF = None
 
-    # Create the hand camera as in the loader (using its defaults).
-    attach_prim = loader._find_prim_by_name("xMate3_link6")  # noqa: SLF001
-    if not attach_prim:
-        for candidate in ("base_link", "xMate3_base_link", "world", "xMate3_link0"):
-            attach_prim = loader._find_prim_by_name(candidate)  # noqa: SLF001
-            if attach_prim:
-                break
-    if attach_prim:
-        mount_path = f"{attach_prim}/hand_camera_mount"
-        loader._ensure_xform(mount_path)  # noqa: SLF001
-        # Keep mount pose consistent with the loader's current fixed pose.
-        theta = loader.math.radians(-10.0)  # noqa: SLF001
-        qx = loader.math.sin(theta * 0.5)  # noqa: SLF001
-        qw = loader.math.cos(theta * 0.5)  # noqa: SLF001
-        loader._set_local_pose(mount_path, pos=(0.0, -0.08, 0.0), quat_xyzw=(qx, 0.0, 0.0, qw))  # noqa: SLF001
-        d405 = None
-        try:
-            d405 = loader._load_d405_json(str(loader.D405_JSON_PATH))  # noqa: SLF001
-        except Exception:
-            d405 = None
-        camera_path, _ = loader._spawn_camera_and_box(mount_path=mount_path, d405=d405)  # noqa: SLF001
-        if not bool(getattr(loader, "_UI_REFS", [])) and not bool(getattr(loader, "_headless", False)):
-            # Bind viewport if possible.
-            try:
-                loader._open_camera_viewport_window(camera_path)  # noqa: SLF001
-            except Exception:
-                pass
-
     # Isaac Sim articulation control (stable in 5.1).
     from isaacsim.core.prims import SingleArticulation  # type: ignore
 
@@ -243,6 +290,8 @@ def _init_robot_scene(*, prim_path: str) -> "SingleArticulation":
         robot.initialize(physics_sim_view=getattr(_WORLD_REF, "physics_sim_view", None))
     except TypeError:
         robot.initialize()
+
+    _spawn_playback_cameras(loader, prim_path=str(prim_path))
     return robot
 
 
@@ -353,6 +402,12 @@ def main() -> None:
             if hand_indices.size > 0:
                 robot.apply_action(ArticulationAction(joint_positions=hand_q[: hand_indices.size], joint_indices=hand_indices))
 
+            if _LOADER_REF is not None:
+                try:
+                    _LOADER_REF._pin_fixed_camera_rig(quiet=True)  # type: ignore[attr-defined]  # noqa: SLF001
+                except Exception:
+                    pass
+
             simulation_app.update()
 
             # Advance frame index based on a simple counter (dataset is 10Hz; update loop is faster).
@@ -375,4 +430,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

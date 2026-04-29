@@ -23,6 +23,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 COMBINED_URDF_PATH = REPO_ROOT / "demo_data" / "l10_hand" / "xMate3_with_right_L10hand.urdf"
 D405_JSON_PATH = REPO_ROOT / "d405json.json"
 RSD455_USD_RELATIVE_PATH = "Isaac/Sensors/Intel/RealSense/rsd455.usd"
+FIXED_CAMERA_RIG_PATH = "/World/fixed_camera_rig"
+FIXED_CAMERA_RIG_POS = (0.1, -0.5, 1.0)
+FIXED_CAMERA_RIG_ROTATION_XYZ_DEG = (180.0, 135.0, 0.0)
 
 # Hand joint drive gains: (stiffness, damping)
 GAINS: dict[str, tuple[float, float]] = {
@@ -86,6 +89,22 @@ def _add_ground_plane() -> None:
     except Exception:
         # Ground plane is optional for visualization.
         pass
+
+
+def _add_scene_light() -> None:
+    """Add a simple environment light so camera viewports are not black."""
+    try:
+        import omni.usd  # type: ignore
+        from pxr import UsdLux  # type: ignore
+    except Exception:
+        return
+
+    stage = omni.usd.get_context().get_stage()
+    if stage is None:
+        return
+
+    light = UsdLux.DomeLight.Define(stage, "/World/defaultDomeLight")
+    light.CreateIntensityAttr(500.0)
 
 
 def _import_urdf(*, urdf_path: str, prim_path: str, fix_base: bool, make_instanceable: bool) -> None:
@@ -325,7 +344,7 @@ def _try_reference_rsd455_usd(prim_path: str) -> str | None:
     return None
 
 
-def _find_first_camera_under(root_prim_path: str) -> str | None:
+def _find_preferred_camera_under(root_prim_path: str) -> str | None:
     import omni.usd  # type: ignore
     from pxr import UsdGeom  # type: ignore
 
@@ -341,13 +360,25 @@ def _find_first_camera_under(root_prim_path: str) -> str | None:
     if not root_prefix.endswith("/"):
         root_prefix = root_prefix + "/"
 
+    cameras: list[str] = []
     for prim in stage.Traverse():
         prim_path = str(prim.GetPath())
         if prim_path != str(root.GetPath()) and not prim_path.startswith(root_prefix):
             continue
         if prim.IsA(UsdGeom.Camera):
-            return prim_path
-    return None
+            cameras.append(prim_path)
+
+    if not cameras:
+        return None
+
+    # The D455 USD contains multiple camera prims. For an RGB viewport, prefer the
+    # color camera; the pseudo-depth camera can render black in a standard viewport.
+    priority_tokens = ("color", "left", "right", "pseudo_depth", "depth")
+    for token in priority_tokens:
+        for camera_path in cameras:
+            if token in camera_path.lower():
+                return camera_path
+    return cameras[0]
 
 
 def _spawn_camera_and_box(*, mount_path: str, d405: dict | None) -> tuple[str, str]:
@@ -395,6 +426,64 @@ def _spawn_camera_and_box(*, mount_path: str, d405: dict | None) -> tuple[str, s
     return camera_path, box_path
 
 
+def _pin_fixed_camera_rig(*, quiet: bool = False) -> None:
+    """Keep the fixed D455 rig static even if the referenced USD carries physics APIs."""
+    import omni.usd  # type: ignore
+    from pxr import Gf, UsdGeom  # type: ignore
+
+    try:
+        from pxr import PhysxSchema, UsdPhysics  # type: ignore
+    except Exception:
+        PhysxSchema = None  # type: ignore[assignment]
+        UsdPhysics = None  # type: ignore[assignment]
+
+    stage = omni.usd.get_context().get_stage()
+    if stage is None:
+        return
+
+    rig_path = FIXED_CAMERA_RIG_PATH
+    yaw_path = f"{rig_path}/yaw"
+    rig = stage.GetPrimAtPath(rig_path)
+    yaw = stage.GetPrimAtPath(yaw_path)
+    if not rig or not rig.IsValid() or not yaw or not yaw.IsValid():
+        return
+
+    _set_local_pos(rig_path, pos=FIXED_CAMERA_RIG_POS)
+
+    yaw_xform = UsdGeom.Xformable(yaw)
+    if yaw_xform.GetOrderedXformOps():
+        yaw_xform.ClearXformOpOrder()
+    yaw_xform.AddRotateXYZOp(precision=UsdGeom.XformOp.PrecisionDouble).Set(
+        Gf.Vec3d(*FIXED_CAMERA_RIG_ROTATION_XYZ_DEG)
+    )
+
+    pinned = 0
+    root_prefix = rig_path if rig_path.endswith("/") else f"{rig_path}/"
+    for prim in stage.Traverse():
+        prim_path = str(prim.GetPath())
+        if prim_path != rig_path and not prim_path.startswith(root_prefix):
+            continue
+
+        if UsdPhysics is not None:
+            try:
+                if prim.HasAPI(UsdPhysics.RigidBodyAPI):
+                    rigid_body = UsdPhysics.RigidBodyAPI.Apply(prim)
+                    rigid_body.CreateKinematicEnabledAttr(True)
+                    pinned += 1
+            except Exception:
+                pass
+
+        if PhysxSchema is not None:
+            try:
+                physx_body = PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
+                physx_body.CreateDisableGravityAttr(True)
+            except Exception:
+                pass
+
+    if not quiet:
+        print(f"[fixed_camera] pinned static rig: {rig_path} (rigid_bodies={pinned})", flush=True)
+
+
 def _spawn_fixed_world_camera_with_box() -> tuple[str, str, str]:
     """Spawn a world-fixed D455 camera and its visible body.
 
@@ -422,7 +511,7 @@ def _spawn_fixed_world_camera_with_box() -> tuple[str, str, str]:
     if stage is None:
         raise RuntimeError("USD stage is not available.")
 
-    rig_path = "/World/fixed_camera_rig"
+    rig_path = FIXED_CAMERA_RIG_PATH
     # Split translate vs rotation so the rig pivots at its world position.
     yaw_path = f"{rig_path}/yaw"
     body_path = f"{yaw_path}/rsd455"
@@ -431,33 +520,39 @@ def _spawn_fixed_world_camera_with_box() -> tuple[str, str, str]:
     camera_path = f"{camera_frame_path}/camera"
 
     UsdGeom.Xform.Define(stage, rig_path)
-    _set_local_pos(rig_path, pos=(0.1, -0.3, 0.6))
+    _set_local_pos(rig_path, pos=FIXED_CAMERA_RIG_POS)
 
     UsdGeom.Xform.Define(stage, yaw_path)
     yaw_xform = UsdGeom.Xformable(stage.GetPrimAtPath(yaw_path))
     if yaw_xform.GetOrderedXformOps():
         yaw_xform.ClearXformOpOrder()
-    rig_rotation_xyz_deg = Gf.Vec3d(180.0, 135.0, 0.0)
+    rig_rotation_xyz_deg = Gf.Vec3d(*FIXED_CAMERA_RIG_ROTATION_XYZ_DEG)
     yaw_xform.AddRotateXYZOp(precision=UsdGeom.XformOp.PrecisionDouble).Set(rig_rotation_xyz_deg)
 
     referenced_d455_usd = _try_reference_rsd455_usd(body_path)
-    asset_camera_path = _find_first_camera_under(body_path) if referenced_d455_usd is not None else None
+    asset_camera_path = _find_preferred_camera_under(body_path) if referenced_d455_usd is not None else None
     if asset_camera_path is not None:
+        _pin_fixed_camera_rig()
         print(f"[fixed_camera] using D455 USD camera prim: {asset_camera_path}", flush=True)
         return rig_path, asset_camera_path, body_path
 
     if referenced_d455_usd is not None:
         print("[warn] D455 USD referenced but no Camera prim was found; creating manual D455 camera.", flush=True)
+        stage.GetPrimAtPath(body_path).GetReferences().ClearReferences()
+        body_visual_path = f"{body_path}/body_proxy"
     else:
-        # Visible fallback body proxy.
-        body = UsdGeom.Cube.Define(stage, body_path)
-        body.CreateSizeAttr(1.0)
-        body_xform = UsdGeom.Xformable(stage.GetPrimAtPath(body_path))
-        if body_xform.GetOrderedXformOps():
-            body_xform.ClearXformOpOrder()
-        body_xform.AddScaleOp(precision=UsdGeom.XformOp.PrecisionDouble).Set(
-            Gf.Vec3d(0.026, 0.124, 0.029)
-        )
+        body_visual_path = body_path
+
+    # Visible fallback body proxy. This is also used when an external reference succeeds
+    # syntactically but does not resolve to an actual Camera prim in the current install.
+    body = UsdGeom.Cube.Define(stage, body_visual_path)
+    body.CreateSizeAttr(1.0)
+    body_xform = UsdGeom.Xformable(stage.GetPrimAtPath(body_visual_path))
+    if body_xform.GetOrderedXformOps():
+        body_xform.ClearXformOpOrder()
+    body_xform.AddScaleOp(precision=UsdGeom.XformOp.PrecisionDouble).Set(
+        Gf.Vec3d(0.026, 0.124, 0.029)
+    )
 
     # USD camera: +X is image right, +Y is image up, view is -Z.
     # Map camera -> rig: +X_cam -> +Y_box, +Y_cam -> +Z_box, +Z_cam -> +X_box
@@ -484,11 +579,12 @@ def _spawn_fixed_world_camera_with_box() -> tuple[str, str, str]:
 
     camera = UsdGeom.Camera.Define(stage, camera_path)
     _apply_d455_fallback_params_to_usd_camera(camera)
+    _pin_fixed_camera_rig()
 
-    return rig_path, camera_path, body_path
+    return rig_path, camera_path, body_visual_path
 
 
-def _open_camera_viewport_window(camera_prim_path: str) -> None:
+def _open_camera_viewport_window(camera_prim_path: str, *, title: str = "Camera") -> None:
     """Open a viewport window and set its active camera."""
     try:
         from omni.kit.viewport.utility import (  # type: ignore
@@ -502,7 +598,7 @@ def _open_camera_viewport_window(camera_prim_path: str) -> None:
     # Create a dedicated viewport window if possible.
     viewport = None
     try:
-        viewport = create_viewport_window("Hand Camera", width=640, height=480)
+        viewport = create_viewport_window(title, width=640, height=480)
     except Exception:
         viewport = None
 
@@ -686,6 +782,7 @@ def main() -> None:
         raise FileNotFoundError(f"URDF not found: {urdf}")
 
     _add_ground_plane()
+    _add_scene_light()
     _import_urdf(
         urdf_path=urdf,
         prim_path=args.prim_path,
@@ -798,4 +895,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
