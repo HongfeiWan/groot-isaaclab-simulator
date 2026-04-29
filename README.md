@@ -47,3 +47,8 @@ LD_PRELOAD="$CONDA_PREFIX/lib/libstdc++.so.6" ~/Project/IsaacLab/isaaclab.sh -p 
 ```bash
 LD_PRELOAD="$CONDA_PREFIX/lib/libstdc++.so.6" ~/Project/IsaacLab/isaaclab.sh -p examples/IsaacLab/play_lerobot_rokae_xmate3_l10hand.py --enable_cameras
 ```
+
+### 5. 启动ik库
+```bash
+LD_PRELOAD="$CONDA_PREFIX/lib/libstdc++.so.6" ~/Project/IsaacLab/isaaclab.sh -p examples/IsaacLab/teleop_xmate3_l10hand_eef_ik.py --enable_cameras
+```
