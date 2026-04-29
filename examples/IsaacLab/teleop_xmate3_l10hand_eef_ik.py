@@ -72,6 +72,18 @@ HAND_JOINT_NAMES = [
     "pinky_mcp_roll",
     "thumb_cmc_roll",
 ]
+HAND_DERIVED_JOINT_NAMES = [
+    "thumb_mcp",
+    "thumb_ip",
+    "index_pip",
+    "index_dip",
+    "middle_pip",
+    "middle_dip",
+    "ring_pip",
+    "ring_dip",
+    "pinky_pip",
+    "pinky_dip",
+]
 HAND_MIMIC_JOINT_NAMES = {
     "thumb_cmc_roll",
     "thumb_cmc_yaw",
@@ -467,6 +479,57 @@ def _apply_joint_positions(
     )
 
 
+def _derive_hand_mimic_positions(master_q: np.ndarray) -> dict[str, float]:
+    master = {name: float(value) for name, value in zip(HAND_JOINT_NAMES, master_q)}
+    return {
+        "thumb_mcp": 1.3898 * master["thumb_cmc_pitch"],
+        "thumb_ip": 1.5080 * master["thumb_cmc_pitch"],
+        "index_pip": 1.3462 * master["index_mcp_pitch"],
+        "index_dip": 0.4616 * master["index_mcp_pitch"],
+        "middle_pip": 1.3462 * master["middle_mcp_pitch"],
+        "middle_dip": 0.4616 * master["middle_mcp_pitch"],
+        "ring_pip": 1.3462 * master["ring_mcp_pitch"],
+        "ring_dip": 0.4616 * master["ring_mcp_pitch"],
+        "pinky_pip": 1.3462 * master["pinky_mcp_pitch"],
+        "pinky_dip": 0.4616 * master["pinky_mcp_pitch"],
+    }
+
+
+def _set_hand_drive_targets_for_loader(master_q: np.ndarray) -> None:
+    """Mirror master targets into USD drive attrs used by the loader mimic helper."""
+    if not _HAND_PRIMS_REF:
+        return
+    try:
+        from pxr import UsdPhysics  # type: ignore
+    except Exception:
+        return
+
+    # _update_hand_mimic_targets() reads angular drive targetPosition attributes, then
+    # writes thumb_mcp/thumb_ip and pip/dip targets from those masters. PhysX angular
+    # drive targetPosition is stored in degrees, while ArticulationAction uses radians.
+    for name, value in zip(HAND_JOINT_NAMES, master_q):
+        prim = _HAND_PRIMS_REF.get(name)
+        if prim is None:
+            continue
+        try:
+            drive = UsdPhysics.DriveAPI.Apply(prim, "angular")
+            drive.CreateTargetPositionAttr(0.0)
+            drive.GetTargetPositionAttr().Set(float(math.degrees(float(value))))
+        except Exception:
+            continue
+
+
+def _apply_l10_hand_positions(
+    robot: "SingleArticulation",
+    master_indices: np.ndarray,
+    derived_indices: dict[str, int],
+    master_q: np.ndarray,
+) -> None:
+    del derived_indices
+    _apply_joint_positions(robot, master_indices, master_q)
+    _set_hand_drive_targets_for_loader(master_q)
+
+
 def _create_target_marker(path: str) -> str | None:
     try:
         import omni.usd  # type: ignore
@@ -514,6 +577,13 @@ class KeyboardTeleop:
         self._pressed: set[str] = set()
         self._enabled = False
 
+    @staticmethod
+    def _normalize_key(value: object) -> str:
+        key_name = str(getattr(value, "name", value)).split(".")[-1].upper()
+        if key_name.startswith("KEY_"):
+            key_name = key_name[4:]
+        return key_name
+
     def start(self) -> None:
         global _KEYBOARD_SUB_REF
         try:
@@ -537,7 +607,7 @@ class KeyboardTeleop:
         release_type = getattr(carb.input.KeyboardEventType, "KEY_RELEASE", None)
 
         def _on_keyboard_event(event, *_) -> bool:
-            key_name = str(getattr(event.input, "name", event.input)).split(".")[-1].upper()
+            key_name = self._normalize_key(event.input)
             if event.type in press_types:
                 self._pressed.add(key_name)
             elif event.type == release_type:
@@ -598,6 +668,15 @@ def main() -> None:
 
         arm_indices = np.asarray([dof_index[n] for n in ARM_JOINT_NAMES], dtype=np.int32)
         hand_indices = np.asarray([dof_index[n] for n in HAND_JOINT_NAMES], dtype=np.int32)
+        derived_hand_indices = {
+            name: int(dof_index[name]) for name in HAND_DERIVED_JOINT_NAMES if name in dof_index
+        }
+        missing_derived = [name for name in HAND_DERIVED_JOINT_NAMES if name not in dof_index]
+        if missing_derived:
+            print(
+                f"[warn] Missing L10 mimic DOFs; USD drive targets only: {missing_derived}",
+                flush=True,
+            )
 
         q_cmd = _parse_vector(str(args.initial_arm_q), 6, name="--initial-arm-q")
         _apply_joint_positions(robot, arm_indices, q_cmd)
@@ -658,7 +737,12 @@ def main() -> None:
                         print(f"[warn] IK failed for target {target_xyz.tolist()}: {e}", flush=True)
 
                 hand_q = (1.0 - hand_alpha) * HAND_OPEN_Q + hand_alpha * HAND_CLOSED_Q
-                _apply_joint_positions(robot, hand_indices, hand_q)
+                _apply_l10_hand_positions(
+                    robot,
+                    hand_indices,
+                    derived_hand_indices,
+                    hand_q,
+                )
                 _set_target_marker(marker_path, target_xyz)
 
             if _LOADER_REF is not None and _HAND_PRIMS_REF:
