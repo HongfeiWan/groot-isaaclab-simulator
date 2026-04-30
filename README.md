@@ -95,3 +95,9 @@ python examples/IsaacLab/compare_l10_gr00t_zero_shot_actions.py \
   --episode-index 0 \
   --output-path outputs/IsaacLab/l10_overfit_compare_ep0.npz
 ```
+
+### 9. 视频精修
+```bash
+pip install streamlit opencv-python pandas pyarrow
+streamlit run examples/IsaacLab/trim_lerobot_episode_viewer.py
+```
