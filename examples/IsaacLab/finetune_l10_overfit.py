@@ -52,6 +52,7 @@ DEFAULT_MODALITY_CONFIG_PATH = (
     REPO_ROOT / "examples" / "IsaacLab" / "rokae_xmate3_l10_modality_config.py"
 )
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "checkpoints" / "rokae_xmate3_l10_overfit"
+DEFAULT_INSTRUCTION = "pick up the bottle and place it in the box"
 
 
 def _parse_args() -> argparse.Namespace:
@@ -65,6 +66,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--modality-config-path", type=str, default=str(DEFAULT_MODALITY_CONFIG_PATH))
     parser.add_argument("--output-dir", type=str, default=str(DEFAULT_OUTPUT_DIR))
     parser.add_argument("--embodiment-tag", type=str, default="NEW_EMBODIMENT")
+    parser.add_argument(
+        "--instruction",
+        type=str,
+        default=DEFAULT_INSTRUCTION,
+        help=(
+            "Language instruction written to task_index 0 in the prepared dataset. "
+            "Use an English task string for best compatibility with the base VLM."
+        ),
+    )
     parser.add_argument("--max-steps", type=int, default=3000)
     parser.add_argument("--save-steps", type=int, default=500)
     parser.add_argument(
@@ -196,7 +206,7 @@ def _load_modality_config(config_path: Path) -> None:
     print(f"[config] loaded modality config: {config_path}", flush=True)
 
 
-def _copy_meta(source_dataset: Path, prepared_dataset: Path) -> None:
+def _copy_meta(source_dataset: Path, prepared_dataset: Path, instruction: str | None) -> None:
     source_meta = source_dataset / "meta"
     prepared_meta = prepared_dataset / "meta"
     prepared_meta.mkdir(parents=True, exist_ok=True)
@@ -210,6 +220,45 @@ def _copy_meta(source_dataset: Path, prepared_dataset: Path) -> None:
     video = modality.get("video", {})
     if "ego_view" not in video:
         raise KeyError(f"Expected ego_view in {modality_path}, got video keys={list(video)}")
+
+    if instruction:
+        _override_primary_instruction(prepared_meta, instruction)
+
+
+def _override_primary_instruction(prepared_meta: Path, instruction: str) -> None:
+    tasks_path = prepared_meta / "tasks.jsonl"
+    task_rows = [
+        json.loads(line)
+        for line in tasks_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    found_task_zero = False
+    for row in task_rows:
+        if int(row["task_index"]) == 0:
+            row["task"] = instruction
+            found_task_zero = True
+            break
+    if not found_task_zero:
+        task_rows.insert(0, {"task_index": 0, "task": instruction})
+    tasks_path.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in task_rows),
+        encoding="utf-8",
+    )
+
+    episodes_path = prepared_meta / "episodes.jsonl"
+    episode_rows = [
+        json.loads(line)
+        for line in episodes_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    for row in episode_rows:
+        if row.get("tasks") == ["teleop"]:
+            row["tasks"] = [instruction]
+    episodes_path.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in episode_rows),
+        encoding="utf-8",
+    )
+    print(f"[data] instruction for task_index=0: {instruction!r}", flush=True)
 
 
 def _ensure_prepared_symlink(link_path: Path, target_path: Path) -> None:
@@ -238,13 +287,14 @@ def _prepare_dataset(
     embodiment_tag: Any,
     modality_config_path: Path,
     force_regenerate_stats: bool,
+    instruction: str | None,
 ) -> Path:
     if not source_dataset.exists():
         raise FileNotFoundError(f"Dataset not found: {source_dataset}")
     prepared_dataset.mkdir(parents=True, exist_ok=True)
     _ensure_prepared_symlink(prepared_dataset / "data", source_dataset / "data")
     _ensure_prepared_symlink(prepared_dataset / "videos", source_dataset / "videos")
-    _copy_meta(source_dataset, prepared_dataset)
+    _copy_meta(source_dataset, prepared_dataset, instruction)
 
     if force_regenerate_stats:
         for name in ("stats.json", "relative_stats.json"):
@@ -435,6 +485,7 @@ def main() -> None:
         embodiment_tag=embodiment_tag,
         modality_config_path=modality_config_path,
         force_regenerate_stats=bool(args.force_regenerate_stats),
+        instruction=str(args.instruction) if args.instruction else None,
     )
     _validate_prepared_loader(prepared_dataset, embodiment_tag)
 

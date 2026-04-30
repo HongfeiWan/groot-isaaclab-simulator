@@ -57,3 +57,28 @@ LD_PRELOAD="$CONDA_PREFIX/lib/libstdc++.so.6" ~/Project/IsaacLab/isaaclab.sh -p 
 ```bash
 LD_PRELOAD="$CONDA_PREFIX/lib/libstdc++.so.6" ~/Project/IsaacLab/isaaclab.sh -p examples/IsaacLab/gr00t_xmate3_l10hand_cube_grasp.py --enable_cameras --policy-port 5555 --instruction "pick up the cube"
 ```
+
+### 7. 启动训练
+```bash
+python examples/IsaacLab/finetune_l10_overfit.py \
+  --instruction "pick up the bottle and place it in the box" \
+  --max-steps 10000 \
+  --global-batch-size 1 \
+  --gradient-accumulation-steps 4 \
+  --tune-projector \
+  --no-tune-diffusion-model \
+  --no-tune-vlln \
+  --load-bf16 \
+  --gradient-checkpointing
+```
+
+### 8. 推理0-shot
+```bash
+python examples/IsaacLab/compare_l10_gr00t_zero_shot_actions.py \
+  --model-path checkpoints/rokae_xmate3_l10_overfit/checkpoint-5000 \
+  --dataset-dir demo_data/l10_hand/lerobot_rokae_xmate3_linker_l10_groot_v1 \
+  --modality-config-path examples/IsaacLab/rokae_xmate3_l10_modality_config.py \
+  --instruction "pick up the bottle and place it in the box" \
+  --episode-index 0 \
+  --output-path outputs/IsaacLab/l10_overfit_compare_ep0.npz
+```
