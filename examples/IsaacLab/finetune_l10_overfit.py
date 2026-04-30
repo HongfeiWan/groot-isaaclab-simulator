@@ -36,6 +36,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import shutil
 import sys
 from typing import Any
@@ -76,6 +77,15 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--max-steps", type=int, default=3000)
+    parser.add_argument(
+        "--auto-resume",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "If output_dir already contains checkpoint-<step>, resume from the largest step "
+            "and continue until --max-steps. If that step is already >= --max-steps, exit."
+        ),
+    )
     parser.add_argument("--save-steps", type=int, default=500)
     parser.add_argument(
         "--global-batch-size",
@@ -146,6 +156,16 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--use-wandb", action="store_true")
     parser.add_argument("--wandb-project", type=str, default="finetune-gr00t-n1d7")
+    parser.add_argument("--use-swanlab", action="store_true")
+    parser.add_argument("--swanlab-project", type=str, default="finetune-gr00t-n1d7")
+    parser.add_argument("--swanlab-workspace", type=str, default=None)
+    parser.add_argument(
+        "--swanlab-mode",
+        type=str,
+        default=None,
+        help="Optional SwanLab mode: cloud, local, offline, or disabled.",
+    )
+    parser.add_argument("--swanlab-logdir", type=str, default=None)
     parser.add_argument("--experiment-name", type=str, default=None)
     parser.add_argument("--save-total-limit", type=int, default=3)
     parser.add_argument(
@@ -157,8 +177,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--save-only-model",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Save smaller checkpoints without optimizer state. Disable if you need resume.",
+        default=False,
+        help=(
+            "Save smaller checkpoints without optimizer state. Keep disabled for exact resume "
+            "with optimizer/scheduler state."
+        ),
     )
     parser.add_argument(
         "--force-regenerate-stats",
@@ -370,6 +393,7 @@ def _build_training_config(args: argparse.Namespace, prepared_dataset: Path, emb
     config.model.use_relative_action = True
 
     config.training.start_from_checkpoint = str(Path(args.base_model_path).expanduser().resolve())
+    config.training.resume_from_checkpoint = bool(args.auto_resume)
     config.training.optim = str(args.optim)
     config.training.global_batch_size = int(args.global_batch_size)
     config.training.gradient_accumulation_steps = int(args.gradient_accumulation_steps)
@@ -385,6 +409,11 @@ def _build_training_config(args: argparse.Namespace, prepared_dataset: Path, emb
     config.training.num_gpus = 1
     config.training.use_wandb = bool(args.use_wandb)
     config.training.wandb_project = str(args.wandb_project)
+    config.training.use_swanlab = bool(args.use_swanlab)
+    config.training.swanlab_project = str(args.swanlab_project)
+    config.training.swanlab_workspace = args.swanlab_workspace
+    config.training.swanlab_mode = args.swanlab_mode
+    config.training.swanlab_logdir = args.swanlab_logdir
     config.training.max_steps = int(args.max_steps)
     config.training.save_only_model = bool(args.save_only_model)
     config.training.transformers_local_files_only = bool(args.local_files_only)
@@ -440,6 +469,76 @@ def _safe_shard_size(
         flush=True,
     )
     return safe_size
+
+
+def _checkpoint_step(checkpoint_dir: Path) -> int | None:
+    match = re.match(r"^checkpoint-(\d+)$", checkpoint_dir.name)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def _training_output_dir(config: Any) -> Path:
+    output_dir = Path(config.training.output_dir)
+    if config.training.experiment_name is not None:
+        output_dir = output_dir / str(config.training.experiment_name)
+    return output_dir
+
+
+def _latest_checkpoint(output_dir: Path) -> tuple[Path, int] | None:
+    if not output_dir.exists():
+        return None
+    candidates: list[tuple[int, Path]] = []
+    for child in output_dir.iterdir():
+        if not child.is_dir():
+            continue
+        step = _checkpoint_step(child)
+        if step is None:
+            continue
+        if not (child / "trainer_state.json").exists():
+            continue
+        candidates.append((step, child))
+    if not candidates:
+        return None
+    step, path = max(candidates, key=lambda item: item[0])
+    return path, step
+
+
+def _handle_auto_resume(args: argparse.Namespace, config: Any) -> bool:
+    if not bool(args.auto_resume):
+        print("[resume] auto-resume disabled; training will start from base model.", flush=True)
+        return True
+
+    output_dir = _training_output_dir(config)
+    latest = _latest_checkpoint(output_dir)
+    if latest is None:
+        print(f"[resume] no existing checkpoint found in {output_dir}; starting fresh.", flush=True)
+        return True
+
+    checkpoint_path, checkpoint_step = latest
+    target_steps = int(config.training.max_steps)
+    if checkpoint_step >= target_steps:
+        print(
+            "[resume] latest checkpoint already reached target max_steps: "
+            f"checkpoint={checkpoint_path}, step={checkpoint_step}, max_steps={target_steps}. "
+            "Nothing to train.",
+            flush=True,
+        )
+        return False
+
+    print(
+        "[resume] found latest checkpoint; training will resume until target max_steps: "
+        f"checkpoint={checkpoint_path}, current_step={checkpoint_step}, max_steps={target_steps}, "
+        f"remaining_steps={target_steps - checkpoint_step}",
+        flush=True,
+    )
+    if bool(config.training.save_only_model):
+        print(
+            "[warn] --save-only-model is enabled. Future checkpoints may not contain optimizer/"
+            "scheduler state, so resume may restart optimizer state even though model weights resume.",
+            flush=True,
+        )
+    return True
 
 
 def _disable_accelerate_deepspeed_import() -> None:
@@ -499,6 +598,10 @@ def main() -> None:
         _disable_accelerate_deepspeed_import()
 
     config = _build_training_config(args, prepared_dataset, embodiment_tag)
+    should_train = _handle_auto_resume(args, config)
+    if not should_train:
+        return
+
     print(
         "[train] starting overfit finetune: "
         f"output_dir={config.training.output_dir}, "

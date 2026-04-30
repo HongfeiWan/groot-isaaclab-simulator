@@ -46,6 +46,7 @@ class TrainingConfig:
 
     start_from_checkpoint: Optional[str] = None
     skip_weight_loading: bool = False  # skip loading checkpoint weights (architecture only)
+    resume_from_checkpoint: bool = True
 
     # Mixed precision
     tf32: bool = True
@@ -100,6 +101,11 @@ class TrainingConfig:
     # Experiment tracking
     use_wandb: bool = False
     wandb_project: str = "finetune-gr00t-n1d7"
+    use_swanlab: bool = False
+    swanlab_project: str = "finetune-gr00t-n1d7"
+    swanlab_workspace: str | None = None
+    swanlab_mode: str | None = None
+    swanlab_logdir: str | None = None
 
     # Profiling
     enable_profiling: bool = False

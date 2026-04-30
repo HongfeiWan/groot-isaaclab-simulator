@@ -7,6 +7,7 @@ MASTER_PORT="${MASTER_PORT:-29500}"
 SAVE_STEPS="${SAVE_STEPS:-1000}"
 MAX_STEPS="${MAX_STEPS:-10000}"
 USE_WANDB="${USE_WANDB:-1}"
+USE_SWANLAB="${USE_SWANLAB:-0}"
 DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-4}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-32}"
 SHARD_SIZE="${SHARD_SIZE:-1024}"
@@ -20,6 +21,10 @@ EMBODIMENT_TAG=""
 OUTPUT_DIR=""
 EXPERIMENT_NAME=""
 WANDB_PROJECT=""
+SWANLAB_PROJECT=""
+SWANLAB_WORKSPACE=""
+SWANLAB_MODE=""
+SWANLAB_LOGDIR=""
 STATE_DROPOUT_PROB=""
 EXTRA_ARGS=()
 
@@ -31,6 +36,8 @@ Usage: bash examples/finetune.sh \
   --embodiment-tag <tag> \
   --output-dir <path> \
   [--modality-config-path <path>] \
+  [--use-swanlab] \
+  [--swanlab-project <name>] \
   [--state-dropout-prob <value>] \
   [--save-only-model] \
   [-- <extra launch_finetune.py args>...]
@@ -65,6 +72,26 @@ while [ "$#" -gt 0 ]; do
             ;;
         --wandb-project)
             WANDB_PROJECT="$2"
+            shift 2
+            ;;
+        --use-swanlab)
+            USE_SWANLAB=1
+            shift
+            ;;
+        --swanlab-project)
+            SWANLAB_PROJECT="$2"
+            shift 2
+            ;;
+        --swanlab-workspace)
+            SWANLAB_WORKSPACE="$2"
+            shift 2
+            ;;
+        --swanlab-mode)
+            SWANLAB_MODE="$2"
+            shift 2
+            ;;
+        --swanlab-logdir)
+            SWANLAB_LOGDIR="$2"
             shift 2
             ;;
         --state-dropout-prob)
@@ -105,6 +132,11 @@ if [ "$USE_WANDB" = "1" ]; then
     WANDB_FLAG+=(--use_wandb)
 fi
 
+SWANLAB_FLAG=()
+if [ "$USE_SWANLAB" = "1" ]; then
+    SWANLAB_FLAG+=(--use_swanlab)
+fi
+
 LAUNCH_CMD=(
     gr00t/experiment/launch_finetune.py
     --base_model_path "$BASE_MODEL_PATH"
@@ -119,6 +151,7 @@ LAUNCH_CMD=(
     --weight_decay 1e-5
     --learning_rate 1e-4
     "${WANDB_FLAG[@]}"
+    "${SWANLAB_FLAG[@]}"
     --global_batch_size "$GLOBAL_BATCH_SIZE"
     --color_jitter_params brightness 0.3 contrast 0.4 saturation 0.5 hue 0.08
     --dataloader_num_workers "$DATALOADER_NUM_WORKERS"
@@ -135,6 +168,18 @@ if [ -n "$EXPERIMENT_NAME" ]; then
 fi
 if [ -n "$WANDB_PROJECT" ]; then
     LAUNCH_CMD+=(--wandb_project "$WANDB_PROJECT")
+fi
+if [ -n "$SWANLAB_PROJECT" ]; then
+    LAUNCH_CMD+=(--swanlab_project "$SWANLAB_PROJECT")
+fi
+if [ -n "$SWANLAB_WORKSPACE" ]; then
+    LAUNCH_CMD+=(--swanlab_workspace "$SWANLAB_WORKSPACE")
+fi
+if [ -n "$SWANLAB_MODE" ]; then
+    LAUNCH_CMD+=(--swanlab_mode "$SWANLAB_MODE")
+fi
+if [ -n "$SWANLAB_LOGDIR" ]; then
+    LAUNCH_CMD+=(--swanlab_logdir "$SWANLAB_LOGDIR")
 fi
 
 if [ -n "$STATE_DROPOUT_PROB" ]; then

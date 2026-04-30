@@ -48,6 +48,92 @@ def setup_logging(debug: bool = False):
     logging.getLogger("datasets").setLevel(logging.WARNING)
 
 
+def _get_report_to(config: Config) -> list[str] | str:
+    report_to = []
+    if config.training.use_wandb:
+        report_to.append("wandb")
+    if config.training.use_swanlab:
+        report_to.append("swanlab")
+    return report_to if report_to else "none"
+
+
+def _tracking_config_dict(config: Config) -> dict:
+    """Build a tracker-friendly config with full GR00T settings."""
+    config_dict = OmegaConf.to_container(OmegaConf.create(config.__dict__), resolve=True)
+    if not isinstance(config_dict, dict):
+        config_dict = dict(config.__dict__)
+    config_dict["git_commit_hash"] = os.environ.get("GROOT_COMMIT_HASH", "unknown")
+    return config_dict
+
+
+def _init_swanlab(config: Config, experiment_name: str, config_dict: dict, tags: list[str]) -> None:
+    try:
+        import swanlab
+    except ImportError as exc:
+        raise ImportError("SwanLab logging requested, but swanlab is not installed.") from exc
+
+    init_kwargs = {
+        "project": config.training.swanlab_project,
+        "experiment_name": experiment_name,
+        "config": config_dict,
+        "tags": tags,
+    }
+    if config.training.swanlab_workspace:
+        init_kwargs["workspace"] = config.training.swanlab_workspace
+    if config.training.swanlab_mode:
+        init_kwargs["mode"] = config.training.swanlab_mode
+    if config.training.swanlab_logdir:
+        init_kwargs["logdir"] = config.training.swanlab_logdir
+
+    if swanlab.get_run() is None:
+        swanlab.init(**init_kwargs)
+    else:
+        swanlab.config.update(config_dict)
+
+
+def _update_tracker_config(config: Config, values: dict, global_rank: int) -> None:
+    if global_rank != 0:
+        return
+    if config.training.use_wandb:
+        wandb.config.update(values, allow_val_change=True)
+    if config.training.use_swanlab:
+        import swanlab
+
+        swanlab.config.update(values)
+
+
+def _model_parameter_stats(model: torch.nn.Module) -> dict:
+    total_parameters = sum(p.numel() for p in model.parameters())
+    trainable_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return {
+        "model_total_parameters": total_parameters,
+        "model_trainable_parameters": trainable_parameters,
+        "model_trainable_ratio": trainable_parameters / total_parameters
+        if total_parameters > 0
+        else 0.0,
+    }
+
+
+def _dataset_length_for_tracking(dataset) -> int | None:
+    if dataset is None:
+        return 0
+    try:
+        return len(dataset)
+    except TypeError:
+        pass
+
+    if hasattr(dataset, "shard_sampling_schedule"):
+        return len(dataset.shard_sampling_schedule)
+    if hasattr(dataset, "num_shards_per_epoch"):
+        return int(dataset.num_shards_per_epoch)
+    if hasattr(dataset, "datasets"):
+        try:
+            return sum(len(child) for child in dataset.datasets)
+        except TypeError:
+            return None
+    return None
+
+
 def warn_configs(config: Config):
     # updates to batch size
     assert config.training.global_batch_size % config.training.num_gpus == 0, (
@@ -166,23 +252,35 @@ def run(config: Config):
             },
             f,
         )
+    swanlab_config_file = output_dir / "swanlab_config.json"
+    with open(swanlab_config_file, "w") as f:
+        json.dump(
+            {
+                "project": config.training.swanlab_project,
+                "workspace": config.training.swanlab_workspace,
+                "mode": config.training.swanlab_mode,
+                "logdir": config.training.swanlab_logdir,
+                "run_id": experiment_name,
+            },
+            f,
+        )
 
     logging.info(f"Saved config to {save_cfg_dir}")
 
-    # Initialize wandb if configured, but only on the main process
-    if config.training.use_wandb and global_rank == 0:
-        # Add git commit hash and version info to config
-        config_dict = {
-            **config.__dict__,
-            "git_commit_hash": os.environ.get("GROOT_COMMIT_HASH", "unknown"),
-        }
+    # Initialize trackers if configured, but only on the main process.
+    tracking_config = _tracking_config_dict(config)
+    tracking_tags = [config.data.mode, type(config.model).__name__]
 
+    if config.training.use_wandb and global_rank == 0:
         wandb.init(
             project=config.training.wandb_project,
             name=experiment_name,
-            config=config_dict,
-            tags=[config.data.mode],
+            config=tracking_config,
+            tags=tracking_tags,
         )
+
+    if config.training.use_swanlab and global_rank == 0:
+        _init_swanlab(config, experiment_name, tracking_config, tracking_tags)
 
     # Setup model training pipeline.
     pipeline = MODEL_REGISTRY.get(type(config.model))(config, save_cfg_dir)
@@ -192,6 +290,16 @@ def run(config: Config):
     data_collator = pipeline.return_collator()
     processor = pipeline.return_processor()
     processor.save_pretrained(processor_dir)
+
+    _update_tracker_config(
+        config,
+        {
+            **_model_parameter_stats(model),
+            "train_dataset_length": _dataset_length_for_tracking(train_dataset),
+            "eval_dataset_length": _dataset_length_for_tracking(eval_dataset),
+        },
+        global_rank,
+    )
 
     # deepspeed config
     if config.training.num_gpus > 1 and not config.training.use_ddp:
@@ -204,6 +312,16 @@ def run(config: Config):
         per_device_train_batch_size = config.training.global_batch_size // config.training.num_gpus
     else:
         per_device_train_batch_size = config.training.batch_size
+    _update_tracker_config(
+        config,
+        {
+            "per_device_train_batch_size": per_device_train_batch_size,
+            "effective_train_batch_size": per_device_train_batch_size
+            * config.training.gradient_accumulation_steps
+            * config.training.num_gpus,
+        },
+        global_rank,
+    )
 
     # Create training arguments
     training_args = TrainingArguments(
@@ -227,7 +345,7 @@ def run(config: Config):
         gradient_checkpointing=config.training.gradient_checkpointing,
         optim=config.training.optim,
         dataloader_num_workers=config.training.dataloader_num_workers,
-        report_to="wandb" if config.training.use_wandb else "none",
+        report_to=_get_report_to(config),
         seed=config.data.seed,
         deepspeed=deepspeed_config,
         ddp_find_unused_parameters=False,
@@ -302,9 +420,9 @@ def run(config: Config):
             on_trace_ready=partial(on_trace_ready_handler, trainer, profile_dir),
         ) as prof:
             trainer.add_callback(ProfCallback(prof=prof))
-            trainer.train(resume_from_checkpoint=True)
+            trainer.train(resume_from_checkpoint=config.training.resume_from_checkpoint)
     else:
-        trainer.train(resume_from_checkpoint=True)
+        trainer.train(resume_from_checkpoint=config.training.resume_from_checkpoint)
 
     # Save final model
     trainer.save_model()

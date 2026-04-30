@@ -70,6 +70,19 @@ python examples/IsaacLab/finetune_l10_overfit.py \
   --no-tune-vlln \
   --load-bf16 \
   --gradient-checkpointing
+
+python examples/IsaacLab/finetune_l10_overfit.py \
+  --instruction "pick up the bottle and place it in the box" \
+  --max-steps 10000 \
+  --global-batch-size 1 \
+  --gradient-accumulation-steps 4 \
+  --tune-projector \
+  --no-tune-diffusion-model \
+  --no-tune-vlln \
+  --load-bf16 \
+  --gradient-checkpointing \
+  --use-swanlab \
+  --swanlab-project rokae-xmate3-l10 
 ```
 
 ### 8. 推理0-shot

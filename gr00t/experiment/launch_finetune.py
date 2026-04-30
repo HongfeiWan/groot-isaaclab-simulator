@@ -103,10 +103,15 @@ if __name__ == "__main__":
     config.training.save_total_limit = ft_config.save_total_limit
     config.training.num_gpus = ft_config.num_gpus
     config.training.use_wandb = ft_config.use_wandb
+    config.training.use_swanlab = ft_config.use_swanlab
     config.training.max_steps = ft_config.max_steps
     config.training.weight_decay = ft_config.weight_decay
     config.training.warmup_ratio = ft_config.warmup_ratio
     config.training.wandb_project = ft_config.wandb_project
+    config.training.swanlab_project = ft_config.swanlab_project
+    config.training.swanlab_workspace = ft_config.swanlab_workspace
+    config.training.swanlab_mode = ft_config.swanlab_mode
+    config.training.swanlab_logdir = ft_config.swanlab_logdir
 
     config.data.shard_size = ft_config.shard_size
     config.data.episode_sampling_rate = ft_config.episode_sampling_rate

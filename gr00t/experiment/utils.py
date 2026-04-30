@@ -70,6 +70,14 @@ class CheckpointFormatCallback(TrainerCallback):
                 print(f"Copying wandb_config.json from {wandb_config_src} to {wandb_config_dst}")
                 shutil.copy2(wandb_config_src, wandb_config_dst)
 
+            swanlab_config_src = Path(args.output_dir) / "swanlab_config.json"
+            swanlab_config_dst = checkpoint_dir / "swanlab_config.json"
+            if swanlab_config_src.exists():
+                print(
+                    f"Copying swanlab_config.json from {swanlab_config_src} to {swanlab_config_dst}"
+                )
+                shutil.copy2(swanlab_config_src, swanlab_config_dst)
+
 
 class BestMetricCheckpointCallback(TrainerCallback):
     """This callback saves the best checkpoint based on the metric."""

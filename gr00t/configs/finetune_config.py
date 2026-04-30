@@ -120,6 +120,18 @@ class FinetuneConfig:
     wandb_project: str = "finetune-gr00t-n1d7"
     """W&B project name to log runs to."""
 
+    swanlab_project: str = "finetune-gr00t-n1d7"
+    """SwanLab project name to log runs to."""
+
+    swanlab_workspace: str | None = None
+    """Optional SwanLab workspace. If None, SwanLab uses its default workspace/account."""
+
+    swanlab_mode: str | None = None
+    """Optional SwanLab mode, for example 'cloud', 'local', 'offline', or 'disabled'."""
+
+    swanlab_logdir: str | None = None
+    """Optional SwanLab local log directory."""
+
     save_steps: int = 1000
     """Frequency (in training steps) at which to save checkpoints."""
 
@@ -134,6 +146,13 @@ class FinetuneConfig:
     If True, log metrics and artifacts to Weights & Biases (wandb).
     The project is `finetune-gr00t-n1d7`.
     You need to login to wandb to view the logs.
+    """
+
+    use_swanlab: bool = False
+    """
+    If True, log Trainer metrics, losses, learning rates, runtime stats, and the full
+    training configuration to SwanLab. You need to login to SwanLab or set
+    SWANLAB_API_KEY for cloud logging.
     """
 
     max_steps: int = 10000
