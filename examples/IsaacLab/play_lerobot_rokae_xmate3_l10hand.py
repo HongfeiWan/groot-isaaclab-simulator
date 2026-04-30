@@ -16,15 +16,28 @@
   [0:7)   arm_joint_pos (第7维占位，当前永远为0；播放时忽略)
   [7:10)  arm_eef_pos (XYZ, rokae_base, m)  (播放脚本不使用，仅用于调试/对齐)
   [10:20) hand_joint_pos (L10 canonical 10DoF)
+
+数据 `action` (dim=13):
+  [0:3)   arm_eef_pos_target (XYZ, rokae_base, m)
+  [3:13)  hand_joint_target (L10 canonical 10DoF)
+
+默认回放方式使用 action 里的末端 XYZ target，通过 teleop 脚本里的 IK 实时解出
+xMate3 关节目标。由于当前数据集不包含 arm orientation action，默认会用
+`observation.state[0:6]` 的 recorded arm joints 经同一 IK/FK 模型反算出末端姿态，
+并用 recorded FK 位置对齐数据集 EEF 点和 IK 的 joint6 点，然后与 action XYZ
+拼成 4x4 pose 做 solve6；相比直接播放 recorded arm joints，
+这样既能保留真实示教的姿态/构型倾向，又能减少关节状态噪声造成的视觉抖动。
 """
 
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import time
+from typing import TYPE_CHECKING
 
 import numpy as np
-from typing import TYPE_CHECKING
+
 
 if TYPE_CHECKING:  # pragma: no cover
     from isaacsim.core.prims import SingleArticulation  # type: ignore
@@ -33,10 +46,12 @@ if TYPE_CHECKING:  # pragma: no cover
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATASET_DIR = REPO_ROOT / "demo_data" / "l10_hand" / "lerobot_rokae_xmate3_linker_l10_groot_v1"
 LOADER_SCRIPT_PATH = REPO_ROOT / "examples" / "IsaacLab" / "load_xmate3_with_right_l10hand_urdf.py"
+TELEOP_SCRIPT_PATH = REPO_ROOT / "examples" / "IsaacLab" / "teleop_xmate3_l10hand_eef_ik.py"
 
 # Keep a world reference alive for the lifetime of the script.
 _WORLD_REF = None
 _LOADER_REF = None
+_TELEOP_REF = None
 _HAND_PRIMS_REF = None
 _CAMERA_PRIMS_REF = {}
 
@@ -49,6 +64,89 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
     parser.add_argument("--fps", type=float, default=0.0, help="0 means use dataset fps from meta/info.json")
     parser.add_argument("--loop", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--speed", type=float, default=1.0, help="Playback speed multiplier.")
+    parser.add_argument(
+        "--playback-clock",
+        choices=("wall", "update60"),
+        default="wall",
+        help=(
+            "wall advances dataset frames by real elapsed time, matching the source video duration. "
+            "update60 advances as if every Isaac update were exactly 1/60s."
+        ),
+    )
+    parser.add_argument(
+        "--arm-source",
+        choices=("action_ik", "state_joint", "state_eef_ik"),
+        default="action_ik",
+        help=(
+            "Arm playback source. action_ik uses action[0:3] EEF target + IK; "
+            "state_joint replays recorded state[0:6]; state_eef_ik uses state[7:10] + IK."
+        ),
+    )
+    parser.add_argument(
+        "--hand-source",
+        choices=("action", "state"),
+        default="action",
+        help="Hand playback source. action uses action[3:13] target; state uses state[10:20].",
+    )
+    parser.add_argument("--max-joint-step", type=float, default=1.0)
+    parser.add_argument("--psi", type=float, default=0.0)
+    parser.add_argument(
+        "--target-rotation-source",
+        choices=("state_fk", "initial_fk", "current_fk"),
+        default="state_fk",
+        help=(
+            "Rotation used for IK pose. state_fk derives each frame's EEF rotation from "
+            "recorded state[0:6] joints; initial_fk keeps the first-frame rotation; "
+            "current_fk keeps the simulated arm's current rotation."
+        ),
+    )
+    parser.add_argument(
+        "--target-position-frame",
+        choices=("state_fk_aligned", "dataset_eef"),
+        default="state_fk_aligned",
+        help=(
+            "Frame used for IK target position. state_fk_aligned treats action/state EEF XYZ "
+            "as the dataset TCP/wrist point and shifts it into the IK FK frame using "
+            "fk(recorded_state_q).xyz - observation.state[7:10]. dataset_eef sends XYZ directly."
+        ),
+    )
+    parser.add_argument(
+        "--ik-seed-source",
+        choices=("state_joint", "current", "blend"),
+        default="state_joint",
+        help=(
+            "Seed used by the IK solver. state_joint selects the branch near the recorded "
+            "demonstration posture; current maximizes continuity; blend mixes both."
+        ),
+    )
+    parser.add_argument(
+        "--ik-seed-state-weight",
+        type=float,
+        default=0.35,
+        help="When --ik-seed-source=blend, weight for recorded state joints in the IK seed.",
+    )
+
+    parser.add_argument(
+        "--ik-backend",
+        choices=("auto", "rci", "urdf"),
+        default="auto",
+        help="IK backend reused from teleop_xmate3_l10hand_eef_ik.py.",
+    )
+    parser.add_argument(
+        "--rci-lib-path",
+        type=str,
+        default=str(
+            REPO_ROOT
+            / "external_dependencies"
+            / "rci_client"
+            / "build"
+            / "bindings"
+            / "libxmate_ik_c.so"
+        ),
+    )
+    parser.add_argument("--rci-ip", type=str, default="127.0.0.1")
+    parser.add_argument("--rci-port", type=int, default=1337)
+    parser.add_argument("--kinematics-json", type=str, default=None)
 
     # Robot loader args (we forward a subset by simply reusing defaults).
     parser.add_argument("--robot-prim-path", type=str, default="/World/xMate3_L10Hand")
@@ -69,7 +167,26 @@ def _read_info_json(dataset_dir: Path) -> dict:
         return json.load(f)
 
 
-def _load_parquet_states(dataset_dir: Path, *, episode_chunk: int, episode_index: int) -> np.ndarray:
+def _column_to_float32_matrix(values, *, expected_dim: int, name: str) -> np.ndarray:
+    if hasattr(values, "to_pylist"):
+        out = np.asarray(values.to_pylist(), dtype=np.float32)
+        if out.ndim != 2 or out.shape[1] != expected_dim:
+            raise RuntimeError(f"Unexpected {name} shape: {out.shape}, expected (*, {expected_dim})")
+        return out
+
+    arr = values.to_numpy(zero_copy_only=False) if hasattr(values, "to_numpy") else values
+    if isinstance(arr, np.ndarray) and arr.ndim == 2 and arr.shape[1] == expected_dim:
+        out = arr.astype(np.float32, copy=False)
+    else:
+        out = np.asarray(list(arr), dtype=np.float32)
+    if out.ndim != 2 or out.shape[1] != expected_dim:
+        raise RuntimeError(f"Unexpected {name} shape: {out.shape}, expected (*, {expected_dim})")
+    return out
+
+
+def _load_parquet_episode(
+    dataset_dir: Path, *, episode_chunk: int, episode_index: int
+) -> tuple[np.ndarray, np.ndarray]:
     parquet_path = dataset_dir / "data" / f"chunk-{episode_chunk:03d}" / f"episode_{episode_index:06d}.parquet"
     if not parquet_path.exists():
         raise FileNotFoundError(f"Episode parquet not found: {parquet_path}")
@@ -78,16 +195,10 @@ def _load_parquet_states(dataset_dir: Path, *, episode_chunk: int, episode_index
     try:
         import pyarrow.parquet as pq  # type: ignore
 
-        table = pq.read_table(parquet_path.as_posix(), columns=["observation.state"])
-        col = table.column("observation.state")
-        arr = col.to_numpy(zero_copy_only=False)
-        if isinstance(arr, np.ndarray) and arr.ndim == 2 and arr.shape[1] == 20:
-            states = arr.astype(np.float32, copy=False)
-        else:
-            states = np.asarray(list(arr), dtype=np.float32)
-        if states.ndim != 2 or states.shape[1] != 20:
-            raise RuntimeError(f"Unexpected observation.state shape: {states.shape}")
-        return states
+        table = pq.read_table(parquet_path.as_posix(), columns=["observation.state", "action"])
+        states = _column_to_float32_matrix(table.column("observation.state"), expected_dim=20, name="observation.state")
+        actions = _column_to_float32_matrix(table.column("action"), expected_dim=13, name="action")
+        return states, actions
     except ModuleNotFoundError:
         pass
     except Exception as e:
@@ -100,13 +211,16 @@ def _load_parquet_states(dataset_dir: Path, *, episode_chunk: int, episode_index
         con = duckdb.connect(database=":memory:")
         # DuckDB returns a column of LIST<FLOAT> for this feature.
         rows = con.execute(
-            "SELECT observation.state AS s FROM read_parquet(?)",
+            'SELECT "observation.state" AS s, action AS a FROM read_parquet(?)',
             [parquet_path.as_posix()],
         ).fetchall()
         states = np.asarray([r[0] for r in rows], dtype=np.float32)
+        actions = np.asarray([r[1] for r in rows], dtype=np.float32)
         if states.ndim != 2 or states.shape[1] != 20:
             raise RuntimeError(f"Unexpected observation.state shape: {states.shape}")
-        return states
+        if actions.ndim != 2 or actions.shape[1] != 13:
+            raise RuntimeError(f"Unexpected action shape: {actions.shape}")
+        return states, actions
     except ModuleNotFoundError:
         pass
     except Exception as e:
@@ -134,6 +248,29 @@ def _import_loader_module():
         raise RuntimeError(f"Failed to create import spec for: {LOADER_SCRIPT_PATH}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    return module
+
+
+def _import_teleop_module():
+    """Import the EEF IK teleop helpers by file path."""
+    global _TELEOP_REF
+    if _TELEOP_REF is not None:
+        return _TELEOP_REF
+
+    import importlib.util
+
+    if not TELEOP_SCRIPT_PATH.exists():
+        raise FileNotFoundError(f"Teleop script not found: {TELEOP_SCRIPT_PATH}")
+
+    spec = importlib.util.spec_from_file_location(
+        "teleop_xmate3_l10hand_eef_ik",
+        TELEOP_SCRIPT_PATH.as_posix(),
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Failed to create import spec for: {TELEOP_SCRIPT_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    _TELEOP_REF = module
     return module
 
 
@@ -242,7 +379,11 @@ def _init_robot_scene(*, prim_path: str) -> "SingleArticulation":
     except Exception:
         pass
 
-    # Apply the same hand drive stiffness/damping as the loader script.
+    # Apply the same stiff arm and hand drive gains as the loader script.
+    try:
+        loader._apply_arm_drive_gains(root_prim_path=str(prim_path))  # type: ignore[attr-defined]  # noqa: SLF001
+    except Exception as e:
+        print(f"[warn] failed to apply arm gains in playback: {e}", flush=True)
     try:
         loader._apply_hand_drive_gains(root_prim_path=str(prim_path))  # type: ignore[attr-defined]  # noqa: SLF001
     except Exception as e:
@@ -327,8 +468,59 @@ def _name_to_dof_index(robot: "SingleArticulation") -> dict[str, int]:
     )
 
 
+def _precompute_state_fk_poses(ik, states: np.ndarray, fallback_pose: np.ndarray) -> np.ndarray:
+    """Use recorded arm joints as posture information by converting them to FK poses."""
+    fallback = np.asarray(fallback_pose, dtype=np.float64).reshape(4, 4)
+    poses = np.repeat(fallback[None, :, :], states.shape[0], axis=0)
+    failures = 0
+
+    for i, state in enumerate(states):
+        q = np.asarray(state[0:6], dtype=np.float64)
+        if q.shape != (6,) or not np.all(np.isfinite(q)):
+            failures += 1
+            continue
+        try:
+            pose = np.asarray(ik.fk6(q), dtype=np.float64).reshape(4, 4)
+            if not np.all(np.isfinite(pose)):
+                raise RuntimeError("non-finite FK pose")
+            poses[i] = pose
+        except Exception:
+            failures += 1
+
+    dataset_xyz = states[:, 7:10].astype(np.float64, copy=False)
+    finite = np.all(np.isfinite(dataset_xyz), axis=1)
+    if np.any(finite):
+        err = np.linalg.norm(poses[finite, :3, 3] - dataset_xyz[finite], axis=1)
+        print(
+            f"[state_fk] precomputed={states.shape[0] - failures}/{states.shape[0]}, "
+            f"fk_vs_state_eef_pos_mean={float(np.mean(err)):.5f}m, "
+            f"max={float(np.max(err)):.5f}m",
+            flush=True,
+        )
+    elif failures:
+        print(f"[state_fk] FK failures={failures}/{states.shape[0]}", flush=True)
+
+    return poses
+
+
+def _select_ik_seed(args: argparse.Namespace, current_q: np.ndarray, recorded_q: np.ndarray) -> np.ndarray:
+    current = np.asarray(current_q, dtype=np.float64).reshape(6)
+    recorded = np.asarray(recorded_q, dtype=np.float64).reshape(6)
+    if not np.all(np.isfinite(recorded)):
+        return current
+
+    source = str(args.ik_seed_source)
+    if source == "state_joint":
+        return recorded
+    if source == "blend":
+        weight = float(np.clip(float(args.ik_seed_state_weight), 0.0, 1.0))
+        return (1.0 - weight) * current + weight * recorded
+    return current
+
+
 def main() -> None:
     args, simulation_app = _parse_args()
+    ik = None
 
     try:
         dataset_dir = Path(args.dataset_dir).expanduser()
@@ -337,49 +529,126 @@ def main() -> None:
         fps = float(args.fps) if float(args.fps) > 1e-6 else dataset_fps
         fps = max(1e-3, fps) * float(args.speed)
 
-        states = _load_parquet_states(
+        states, actions = _load_parquet_episode(
             dataset_dir, episode_chunk=int(args.episode_chunk), episode_index=int(args.episode_index)
         )
-        print(f"Loaded states: T={states.shape[0]}, dim={states.shape[1]}, fps={fps:g}", flush=True)
+        print(
+            f"Loaded episode: T={states.shape[0]}, state_dim={states.shape[1]}, "
+            f"action_dim={actions.shape[1]}, fps={fps:g}",
+            flush=True,
+        )
+
+        teleop = _import_teleop_module()
+        pose_from_xyz_rotation = None
+        if str(args.arm_source) != "state_joint":
+            ik, pose_from_xyz_rotation = teleop._create_ik(args)  # noqa: SLF001
     except Exception as e:
         # Exit gracefully without a long traceback in the IsaacLab UI.
         print(f"[error] Playback init failed: {e}", flush=True)
+        try:
+            if ik is not None:
+                ik.close()
+        except Exception:
+            pass
         simulation_app.close()
         return
 
-    # Build scene + robot.
-    robot = _init_robot_scene(prim_path=str(args.robot_prim_path))
-    dof_index = _name_to_dof_index(robot)
-
-    # Joint name mapping.
-    arm_joint_names = [f"xMate3_joint_{i}" for i in range(1, 7)]
-    hand_joint_names = [
-        "thumb_cmc_pitch",
-        "thumb_cmc_yaw",
-        "index_mcp_pitch",
-        "middle_mcp_pitch",
-        "ring_mcp_pitch",
-        "pinky_mcp_pitch",
-        "index_mcp_roll",
-        "ring_mcp_roll",
-        "pinky_mcp_roll",
-        "thumb_cmc_roll",
-    ]
-
-    # Resolve indices (skip any missing, but print once).
-    missing = [n for n in arm_joint_names + hand_joint_names if n not in dof_index]
-    if missing:
-        print(f"[warn] Missing joint names in articulation: {missing}", flush=True)
-
-    arm_indices = np.array([dof_index[n] for n in arm_joint_names if n in dof_index], dtype=np.int32)
-    hand_indices = np.array([dof_index[n] for n in hand_joint_names if n in dof_index], dtype=np.int32)
-
-    from isaacsim.core.utils.types import ArticulationAction  # type: ignore
-
-    # Playback loop.
-    dt_wall = 1.0 / fps
-    t = 0
     try:
+        # Build scene + robot.
+        robot = _init_robot_scene(prim_path=str(args.robot_prim_path))
+        dof_index = _name_to_dof_index(robot)
+
+        # Keep teleop's hand helper pointed at the prim cache created by this playback scene.
+        try:
+            teleop._HAND_PRIMS_REF = _HAND_PRIMS_REF  # noqa: SLF001
+            teleop._LOADER_REF = _LOADER_REF  # noqa: SLF001
+        except Exception:
+            pass
+
+        # Joint name mapping. Prefer teleop's constants so playback and teleop stay aligned.
+        arm_joint_names = list(getattr(teleop, "ARM_JOINT_NAMES", [f"xMate3_joint_{i}" for i in range(1, 7)]))
+        hand_joint_names = list(
+            getattr(
+                teleop,
+                "HAND_JOINT_NAMES",
+                [
+                    "thumb_cmc_pitch",
+                    "thumb_cmc_yaw",
+                    "index_mcp_pitch",
+                    "middle_mcp_pitch",
+                    "ring_mcp_pitch",
+                    "pinky_mcp_pitch",
+                    "index_mcp_roll",
+                    "ring_mcp_roll",
+                    "pinky_mcp_roll",
+                    "thumb_cmc_roll",
+                ],
+            )
+        )
+        derived_hand_names = list(getattr(teleop, "HAND_DERIVED_JOINT_NAMES", []))
+
+        # Resolve indices (skip any missing, but print once).
+        missing = [n for n in arm_joint_names + hand_joint_names if n not in dof_index]
+        if missing:
+            print(f"[warn] Missing joint names in articulation: {missing}", flush=True)
+
+        arm_indices = np.array([dof_index[n] for n in arm_joint_names if n in dof_index], dtype=np.int32)
+        hand_indices = np.array([dof_index[n] for n in hand_joint_names if n in dof_index], dtype=np.int32)
+        derived_hand_indices = {name: int(dof_index[name]) for name in derived_hand_names if name in dof_index}
+
+        if str(args.arm_source) != "state_joint" and arm_indices.size != 6:
+            raise RuntimeError(
+                f"IK playback requires all 6 xMate3 arm joints, got {arm_indices.size}: {arm_joint_names}"
+            )
+
+        q_cmd = states[0, 0:6].astype(np.float64, copy=True)
+        if q_cmd.shape != (6,) or not np.all(np.isfinite(q_cmd)):
+            q_cmd = np.asarray(getattr(teleop, "DEFAULT_ARM_Q"), dtype=np.float64).copy()
+        if arm_indices.size > 0:
+            teleop._apply_joint_positions(robot, arm_indices, q_cmd[: arm_indices.size])  # noqa: SLF001
+
+        initial_hand = actions[0, 3:13] if str(args.hand_source) == "action" else states[0, 10:20]
+        if hand_indices.size > 0 and np.all(np.isfinite(initial_hand)):
+            teleop._apply_l10_hand_positions(  # noqa: SLF001
+                robot,
+                hand_indices,
+                derived_hand_indices,
+                initial_hand,
+            )
+
+        for _ in range(3):
+            simulation_app.update()
+
+        target_rotation = None
+        initial_rotation = None
+        state_fk_poses = None
+        if str(args.arm_source) != "state_joint":
+            assert ik is not None
+            current_pose = ik.fk6(q_cmd)
+            initial_rotation = current_pose[:3, :3].copy()
+            target_rotation = initial_rotation
+            if (
+                str(args.target_rotation_source) == "state_fk"
+                or str(args.target_position_frame) == "state_fk_aligned"
+            ):
+                state_fk_poses = _precompute_state_fk_poses(ik, states, current_pose)
+
+        print(
+            f"[playback] arm_source={args.arm_source}, hand_source={args.hand_source}, "
+            f"position_frame={args.target_position_frame}, "
+            f"rotation_source={args.target_rotation_source}, seed_source={args.ik_seed_source}, "
+            f"max_joint_step={float(args.max_joint_step):g}",
+            flush=True,
+        )
+
+        # Playback loop.
+        dt_wall = 1.0 / fps
+        render_dt = 1.0 / 60.0
+        accum = 0.0
+        t = 0
+        fail_count = 0
+        last_frame_time = time.perf_counter()
+
         while simulation_app.is_running():
             # Keep mimic joints' targetPosition consistent with masters (if loader helpers exist).
             if _LOADER_REF is not None and _HAND_PRIMS_REF:
@@ -391,16 +660,79 @@ def main() -> None:
                 except Exception:
                     pass
 
-            # Play one frame per wall tick (simple throttle via accumulation).
-            # Using Kit time is overkill here; the dataset fps is low (10Hz).
             s = states[t]
-            arm_q = s[0:6].astype(np.float32, copy=False)
-            hand_q = s[10:20].astype(np.float32, copy=False)
+            a = actions[t]
 
-            if arm_indices.size > 0:
-                robot.apply_action(ArticulationAction(joint_positions=arm_q[: arm_indices.size], joint_indices=arm_indices))
-            if hand_indices.size > 0:
-                robot.apply_action(ArticulationAction(joint_positions=hand_q[: hand_indices.size], joint_indices=hand_indices))
+            if str(args.arm_source) == "state_joint":
+                arm_q = s[0:6].astype(np.float64, copy=False)
+                if arm_indices.size > 0 and np.all(np.isfinite(arm_q)):
+                    q_cmd = arm_q.copy()
+                    teleop._apply_joint_positions(  # noqa: SLF001
+                        robot, arm_indices, q_cmd[: arm_indices.size]
+                    )
+            else:
+                target_xyz = (
+                    a[0:3].astype(np.float64, copy=False)
+                    if str(args.arm_source) == "action_ik"
+                    else s[7:10].astype(np.float64, copy=False)
+                )
+                if np.all(np.isfinite(target_xyz)):
+                    if (
+                        str(args.target_position_frame) == "state_fk_aligned"
+                        and state_fk_poses is not None
+                    ):
+                        state_eef_xyz = s[7:10].astype(np.float64, copy=False)
+                        if np.all(np.isfinite(state_eef_xyz)):
+                            target_xyz = target_xyz + (state_fk_poses[t, :3, 3] - state_eef_xyz)
+
+                    recorded_arm_q = s[0:6].astype(np.float64, copy=False)
+                    current_q = teleop._current_arm_q(robot, arm_indices, q_cmd)  # noqa: SLF001
+                    q_seed = _select_ik_seed(args, current_q, recorded_arm_q)
+                    try:
+                        assert ik is not None
+                        assert pose_from_xyz_rotation is not None
+                        assert initial_rotation is not None
+
+                        if str(args.target_rotation_source) == "state_fk" and state_fk_poses is not None:
+                            target_rotation = state_fk_poses[t, :3, :3]
+                        elif str(args.target_rotation_source) == "current_fk":
+                            target_rotation = ik.fk6(current_q)[:3, :3]
+                        else:
+                            target_rotation = initial_rotation
+
+                        target_pose = pose_from_xyz_rotation(target_xyz, target_rotation)
+                        q_target = ik.solve6(target_pose, q_seed, psi=float(args.psi))
+                        if not np.all(np.isfinite(q_target)):
+                            raise RuntimeError(f"non-finite IK result: {q_target}")
+                        # q_seed selects the desired IK branch; the actual command is rate-limited
+                        # from the current simulated joint position to avoid replaying recorded jitter.
+                        q_cmd = current_q + np.clip(
+                            q_target - current_q,
+                            -float(args.max_joint_step),
+                            float(args.max_joint_step),
+                        )
+                        teleop._apply_joint_positions(robot, arm_indices, q_cmd)  # noqa: SLF001
+                        fail_count = 0
+                    except Exception as e:
+                        fail_count += 1
+                        if fail_count == 1 or fail_count % 30 == 0:
+                            print(
+                                f"[warn] IK failed at frame {t}, target={target_xyz.tolist()}: {e}",
+                                flush=True,
+                            )
+
+            hand_q = (
+                a[3:13].astype(np.float64, copy=False)
+                if str(args.hand_source) == "action"
+                else s[10:20].astype(np.float64, copy=False)
+            )
+            if hand_indices.size > 0 and np.all(np.isfinite(hand_q)):
+                teleop._apply_l10_hand_positions(  # noqa: SLF001
+                    robot,
+                    hand_indices,
+                    derived_hand_indices,
+                    hand_q,
+                )
 
             if _LOADER_REF is not None:
                 try:
@@ -410,21 +742,31 @@ def main() -> None:
 
             simulation_app.update()
 
-            # Advance frame index based on a simple counter (dataset is 10Hz; update loop is faster).
-            # We step by 1 every N sim updates to approximate dt_wall without importing extra timing utils.
-            # If you need tighter sync, we can switch to carb.clock / timeline time.
-            if getattr(main, "_accum", None) is None:
-                main._accum = 0.0  # type: ignore[attr-defined]
-            main._accum += 1.0 / 60.0  # type: ignore[attr-defined]
-            if main._accum >= dt_wall:  # type: ignore[attr-defined]
-                main._accum = 0.0  # type: ignore[attr-defined]
+            if str(args.playback_clock) == "wall":
+                now = time.perf_counter()
+                # Cap very long stalls so a pause/window drag does not jump across the whole episode.
+                accum += min(max(now - last_frame_time, 0.0), 0.5)
+                last_frame_time = now
+            else:
+                accum += render_dt
+
+            while accum >= dt_wall:
+                accum -= dt_wall
                 t += 1
                 if t >= states.shape[0]:
                     if bool(args.loop):
                         t = 0
+                        q_cmd = states[0, 0:6].astype(np.float64, copy=True)
                     else:
                         break
+            if not bool(args.loop) and t >= states.shape[0]:
+                break
     finally:
+        try:
+            if ik is not None:
+                ik.close()
+        except Exception:
+            pass
         simulation_app.close()
 
 

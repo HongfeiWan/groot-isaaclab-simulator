@@ -27,6 +27,21 @@ FIXED_CAMERA_RIG_PATH = "/World/fixed_camera_rig"
 FIXED_CAMERA_RIG_POS = (0.1, -0.5, 1.0)
 FIXED_CAMERA_RIG_ROTATION_XYZ_DEG = (180.0, 135.0, 0.0)
 
+# Arm joint drive gains: (stiffness, damping)
+#
+# These are intentionally stiff for Isaac Sim playback/policy debugging. The real
+# robot should still be controlled through its own controller limits; these values
+# only make the simulated articulation track joint targets almost like a rigid rig.
+ARM_GAINS: dict[str, tuple[float, float]] = {
+    "xMate3_joint_1": (250000.0, 25000.0),
+    "xMate3_joint_2": (300000.0, 30000.0),
+    "xMate3_joint_3": (300000.0, 30000.0),
+    "xMate3_joint_4": (180000.0, 18000.0),
+    "xMate3_joint_5": (180000.0, 18000.0),
+    "xMate3_joint_6": (140000.0, 14000.0),
+}
+ARM_MAX_FORCE = 1.0e9
+
 # Hand joint drive gains: (stiffness, damping)
 GAINS: dict[str, tuple[float, float]] = {
     "thumb_cmc_roll": (3000.0, 300.0),
@@ -689,6 +704,58 @@ def _apply_hand_drive_gains(*, root_prim_path: str) -> None:
     print(f"[hand_gains] applied={applied}, skipped={skipped}, root={root_prim_path}", flush=True)
 
 
+def _apply_arm_drive_gains(*, root_prim_path: str) -> None:
+    """Apply stiff PhysX position-drive gains to the xMate3 arm joints."""
+    try:
+        import omni.usd  # type: ignore
+        from pxr import PhysxSchema, UsdPhysics  # type: ignore
+    except Exception as e:
+        print(f"[warn] PhysX schema not available; skip arm gains: {e}", flush=True)
+        return
+
+    stage = omni.usd.get_context().get_stage()
+    if stage is None:
+        print("[warn] USD stage not available; skip arm gains.", flush=True)
+        return
+
+    root_prim = stage.GetPrimAtPath(root_prim_path)
+    if not root_prim or not root_prim.IsValid():
+        print(f"[warn] Robot prim not found for arm gains: {root_prim_path}", flush=True)
+        return
+    root_prefix = str(root_prim.GetPath())
+    if not root_prefix.endswith("/"):
+        root_prefix = root_prefix + "/"
+
+    applied = 0
+    skipped = 0
+    for prim in stage.Traverse():
+        prim_path = str(prim.GetPath())
+        if prim_path != str(root_prim.GetPath()) and not prim_path.startswith(root_prefix):
+            continue
+        gain = ARM_GAINS.get(prim.GetName())
+        if gain is None:
+            continue
+
+        k, d = gain
+        try:
+            drive = UsdPhysics.DriveAPI.Apply(prim, "angular")
+            drive.CreateStiffnessAttr(float(k))
+            drive.CreateDampingAttr(float(d))
+            drive.CreateMaxForceAttr(float(ARM_MAX_FORCE))
+            drive.CreateTargetVelocityAttr(0.0)
+            drive.CreateTargetPositionAttr(0.0)
+
+            physx_drive = PhysxSchema.PhysxDriveAPI.Apply(prim, "angular")
+            physx_drive.CreateStiffnessAttr(float(k))
+            physx_drive.CreateDampingAttr(float(d))
+            physx_drive.CreateMaxForceAttr(float(ARM_MAX_FORCE))
+            applied += 1
+        except Exception:
+            skipped += 1
+
+    print(f"[arm_gains] applied={applied}, skipped={skipped}, root={root_prim_path}", flush=True)
+
+
 def _collect_named_prims_under(*, root_prim_path: str, names: set[str]) -> dict[str, object]:
     """Collect first prim for each name under the given root path."""
     import omni.usd  # type: ignore
@@ -791,7 +858,8 @@ def main() -> None:
     )
     print(f"Imported URDF: {urdf} -> {args.prim_path}", flush=True)
 
-    # Apply L10 hand joint stiffness/damping.
+    # Apply stiff arm gains first, then L10 hand joint stiffness/damping.
+    _apply_arm_drive_gains(root_prim_path=str(args.prim_path))
     _apply_hand_drive_gains(root_prim_path=str(args.prim_path))
 
     # Cache prim handles for master + mimic joints so we can update mimic targets every tick.
