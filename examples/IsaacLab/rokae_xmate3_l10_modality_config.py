@@ -10,14 +10,14 @@ from gr00t.data.types import (
 
 
 rokae_xmate3_l10_config = {
-    # Video keys must match meta/modality.json. In the IsaacLab scripts:
-    # - ego_view: fixed/head-style D455 view
-    # - wrist_view: wrist/hand-mounted D405 view
+    # Video keys must match meta/modality.json.
+    # Use the available head/front camera only. Do not declare a missing wrist
+    # camera; keeping train/test modalities identical avoids a black/fake-view
+    # distribution shift.
     "video": ModalityConfig(
         delta_indices=[0],
         modality_keys=[
             "ego_view",
-            "wrist_view",
         ],
     ),
     # observation.state dim=20:

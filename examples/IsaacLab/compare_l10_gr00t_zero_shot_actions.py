@@ -109,10 +109,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--instruction", type=str, default=None)
     parser.add_argument("--no-plot", action="store_true")
     parser.add_argument(
-        "--duplicate-missing-video",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Duplicate the first dataset video stream when the config asks for a missing view.",
+        "--missing-video-mode",
+        choices=("black", "duplicate", "error"),
+        default="black",
+        help="How to fill configured video views that are missing from the dataset.",
     )
     parser.add_argument(
         "--strict-policy",
@@ -389,6 +389,25 @@ def _load_video_frames(
     return np.asarray(frames, dtype=np.uint8)
 
 
+def _black_video_frames(
+    dataset_dir: Path,
+    *,
+    fallback_video_key: str | None,
+    num_frames: int,
+) -> np.ndarray:
+    info = _read_json(dataset_dir / "meta" / "info.json")
+    modality_meta = _read_json(dataset_dir / "meta" / "modality.json")
+    height, width, channels = 480, 640, 3
+    if fallback_video_key is not None and fallback_video_key in modality_meta.get("video", {}):
+        original_key = modality_meta["video"][fallback_video_key].get(
+            "original_key", f"observation.images.{fallback_video_key}"
+        )
+        shape = info.get("features", {}).get(original_key, {}).get("shape")
+        if shape and len(shape) == 3:
+            height, width, channels = [int(v) for v in shape]
+    return np.zeros((int(num_frames), height, width, channels), dtype=np.uint8)
+
+
 def _extract_groups(
     matrix: np.ndarray,
     modality_meta: dict[str, Any],
@@ -423,7 +442,7 @@ def _build_observation(
     modality_meta: dict[str, Any],
     instruction: str,
     video_backend: str,
-    duplicate_missing_video: bool,
+    missing_video_mode: str,
 ) -> dict[str, Any]:
     obs: dict[str, Any] = {"video": {}, "state": {}, "language": {}}
 
@@ -436,20 +455,29 @@ def _build_observation(
     fallback_video_key = dataset_video_keys[0] if dataset_video_keys else None
     for key in modality_config["video"].modality_keys:
         source_key = key
+        delta = np.asarray(modality_config["video"].delta_indices, dtype=np.int64)
+        indices = np.clip(step + delta, 0, len(states_by_key[next(iter(states_by_key))]) - 1)
         if source_key not in modality_meta.get("video", {}):
-            if not duplicate_missing_video or fallback_video_key is None:
+            if missing_video_mode == "error" or fallback_video_key is None:
                 raise KeyError(
                     f"Video key '{key}' not in dataset modality.json. "
                     f"Available: {dataset_video_keys}"
                 )
+            if missing_video_mode == "black":
+                logging.warning("Video key '%s' is missing in dataset; using black frames.", key)
+                frames = _black_video_frames(
+                    dataset_dir,
+                    fallback_video_key=fallback_video_key,
+                    num_frames=len(indices),
+                )
+                obs["video"][key] = frames[None, :].astype(np.uint8, copy=False)
+                continue
             logging.warning(
                 "Video key '%s' is missing in dataset; duplicating '%s'.",
                 key,
                 fallback_video_key,
             )
             source_key = fallback_video_key
-        delta = np.asarray(modality_config["video"].delta_indices, dtype=np.int64)
-        indices = np.clip(step + delta, 0, len(states_by_key[next(iter(states_by_key))]) - 1)
         frames = _load_video_frames(
             dataset_dir,
             episode_index=episode_index,
@@ -630,7 +658,7 @@ def _run_episode(
             modality_meta=modality_meta,
             instruction=instruction,
             video_backend=str(args.video_backend),
-            duplicate_missing_video=bool(args.duplicate_missing_video),
+            missing_video_mode=str(args.missing_video_mode),
         )
         rtc_options = _rtc_options(
             args=args,
