@@ -101,3 +101,51 @@ python examples/IsaacLab/compare_l10_gr00t_zero_shot_actions.py \
 pip install streamlit opencv-python pandas pyarrow
 streamlit run examples/IsaacLab/trim_lerobot_episode_viewer.py
 ```
+
+### 10. 使用精修后的trimmed数据集继续训练到20000轮
+该脚本默认使用 `outputs/IsaacLab/trimmed_l10_dataset` 作为训练数据，输出目录仍然是 `checkpoints/rokae_xmate3_l10_overfit`。如果目录下已经有 `checkpoint-*`，会自动从数字最大的checkpoint继续训练，默认训练目标是 `20000` step。
+
+```bash
+python examples/IsaacLab/finetune_l10_overfit_on_trimmed_dataset.py
+```
+
+只准备并检查trimmed训练数据，不启动模型训练：
+
+```bash
+python examples/IsaacLab/finetune_l10_overfit_on_trimmed_dataset.py \
+  --prepare-only
+```
+
+如果需要覆盖默认训练参数，可以继续追加和 `finetune_l10_overfit.py` 一样的参数：
+
+```bash
+python examples/IsaacLab/finetune_l10_overfit_on_trimmed_dataset.py \
+  --max-steps 20000 \
+  --global-batch-size 1 \
+  --gradient-accumulation-steps 4 \
+  --use-swanlab \
+  --swanlab-project rokae-xmate3-l10
+```
+
+### 11. 评估trimmed数据集上的L10过拟合模型
+该脚本默认评估 `outputs/IsaacLab/trimmed_l10_dataset`，并自动选择 `checkpoints/rokae_xmate3_l10_overfit` 下数字最大的 `checkpoint-*`。评估结果会写入 `outputs/IsaacLab/l10_overfit_trimmed_eval`，包括 `evaluation_summary.json`、`per_episode_metrics.csv` 以及每个episode的预测对比文件。
+
+```bash
+python examples/IsaacLab/evaluate_l10_overfit_on_trimmed_dataset.py
+```
+
+指定使用 `checkpoint-20000` 进行评估：
+
+```bash
+python examples/IsaacLab/evaluate_l10_overfit_on_trimmed_dataset.py \
+  --model-path checkpoints/rokae_xmate3_l10_overfit/checkpoint-20000
+```
+
+只评估部分episode并关闭图片绘制：
+
+```bash
+python examples/IsaacLab/evaluate_l10_overfit_on_trimmed_dataset.py \
+  --model-path checkpoints/rokae_xmate3_l10_overfit/checkpoint-20000 \
+  --episode-indices 0 1 2 \
+  --no-plot
+```
