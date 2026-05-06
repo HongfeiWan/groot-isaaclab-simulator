@@ -17,8 +17,6 @@ import importlib
 from pathlib import Path
 import typing
 
-import tyro
-
 
 MODEL_CONFIG_TYPES: dict[str, type] = {}
 
@@ -42,6 +40,13 @@ def create_model_union_type():
     if not MODEL_CONFIG_TYPES:
         # A Union of no types is invalid, so just return None
         return None
+
+    try:
+        import tyro
+    except ImportError:
+        # Inference paths import the model registry but do not need tyro's CLI metadata.
+        model_types = tuple(MODEL_CONFIG_TYPES.values())
+        return model_types[0] if len(model_types) == 1 else typing.Union.__getitem__(model_types)
 
     annotated_types = tuple(
         typing.Annotated[model_type, tyro.conf.subcommand(model_shortname)]

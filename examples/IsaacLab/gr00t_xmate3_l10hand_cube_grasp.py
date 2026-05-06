@@ -61,7 +61,13 @@ DEFAULT_IMAGE_SIZE = (180, 320)
 DEFAULT_CUBE_POS = (-0.5, -0.5, 0.6)
 DEFAULT_CUBE_SIZE = 0.055
 DEFAULT_TABLE_TOP_Z = DEFAULT_CUBE_POS[2] - DEFAULT_CUBE_SIZE * 0.5
+DEFAULT_TABLE_XY_SIZE = 0.45
 DEFAULT_INITIAL_EEF_XYZ = (-0.7, -0.3, 0.6)
+BOTTLE_BODY_HEIGHT_RATIO = 0.72
+BOTTLE_NECK_HEIGHT_RATIO = 0.22
+BOTTLE_CAP_HEIGHT_RATIO = 0.06
+BOTTLE_BODY_RADIUS_RATIO = 0.16
+BOTTLE_NECK_RADIUS_RATIO = 0.07
 
 WORLD_REF = None
 LOADER_REF = None
@@ -87,6 +93,10 @@ def _parse_vector(text: str, length: int, *, name: str) -> np.ndarray:
             f"{name} must contain {length} comma-separated floats, got {values.shape[0]}"
         )
     return values
+
+
+def _infer_table_top_z(cube_position: np.ndarray, cube_size: float) -> float:
+    return float(np.asarray(cube_position, dtype=np.float64).reshape(3)[2] - float(cube_size) * 0.5)
 
 
 def _resize_with_pad(image: np.ndarray, height: int, width: int) -> np.ndarray:
@@ -123,6 +133,9 @@ def _as_hwc_uint8(value: Any, *, image_size: tuple[int, int]) -> np.ndarray:
 
     if isinstance(image, np.ndarray) and image.dtype.fields is not None:
         image = image.view(np.uint8).reshape(image.shape + (-1,))
+    elif isinstance(image, np.ndarray) and image.dtype == np.uint32:
+        # Some Isaac/Replicator RGB buffers arrive as packed 32-bit RGBA values.
+        image = image.view(np.uint8).reshape(image.shape + (4,))
 
     while image.ndim > 3:
         image = image[0]
@@ -192,6 +205,105 @@ def _spawn_cube(*, prim_path: str, position: np.ndarray, size: float, mass: floa
     mass_api = UsdPhysics.MassAPI.Apply(prim)
     mass_api.CreateMassAttr(float(mass))
     PhysxSchema.PhysxRigidBodyAPI.Apply(prim).CreateDisableGravityAttr(False)
+
+
+def _set_xform_pose(
+    xform: Any,
+    *,
+    translate: tuple[float, float, float] | np.ndarray,
+    scale: tuple[float, float, float] | np.ndarray | None = None,
+) -> None:
+    from pxr import Gf, UsdGeom  # type: ignore
+
+    if xform.GetOrderedXformOps():
+        xform.ClearXformOpOrder()
+    xform.AddTranslateOp(precision=UsdGeom.XformOp.PrecisionDouble).Set(
+        Gf.Vec3d(float(translate[0]), float(translate[1]), float(translate[2]))
+    )
+    if scale is not None:
+        xform.AddScaleOp(precision=UsdGeom.XformOp.PrecisionDouble).Set(
+            Gf.Vec3d(float(scale[0]), float(scale[1]), float(scale[2]))
+        )
+
+
+def _spawn_bottle(*, prim_path: str, position: np.ndarray, height: float, mass: float) -> None:
+    import omni.usd  # type: ignore
+    from pxr import Gf, PhysxSchema, UsdGeom, UsdPhysics  # type: ignore
+
+    stage = omni.usd.get_context().get_stage()
+    if stage is None:
+        raise RuntimeError("USD stage is not available.")
+
+    position = np.asarray(position, dtype=np.float64).reshape(3)
+    height = float(height)
+    body_height = height * BOTTLE_BODY_HEIGHT_RATIO
+    neck_height = height * BOTTLE_NECK_HEIGHT_RATIO
+    cap_height = height * BOTTLE_CAP_HEIGHT_RATIO
+    body_radius = height * BOTTLE_BODY_RADIUS_RATIO
+    neck_radius = height * BOTTLE_NECK_RADIUS_RATIO
+
+    root = UsdGeom.Xform.Define(stage, prim_path)
+    _set_xform_pose(
+        UsdGeom.Xformable(root.GetPrim()),
+        translate=(float(position[0]), float(position[1]), float(position[2])),
+    )
+
+    body_path = f"{prim_path}/body"
+    body = UsdGeom.Cylinder.Define(stage, body_path)
+    body.CreateAxisAttr("Z")
+    body.CreateRadiusAttr(body_radius)
+    body.CreateHeightAttr(body_height)
+    body.CreateDisplayColorAttr([Gf.Vec3f(0.08, 0.38, 0.9)])
+    _set_xform_pose(
+        UsdGeom.Xformable(body.GetPrim()),
+        translate=(0.0, 0.0, -height * 0.5 + body_height * 0.5),
+    )
+
+    neck_path = f"{prim_path}/neck"
+    neck = UsdGeom.Cylinder.Define(stage, neck_path)
+    neck.CreateAxisAttr("Z")
+    neck.CreateRadiusAttr(neck_radius)
+    neck.CreateHeightAttr(neck_height)
+    neck.CreateDisplayColorAttr([Gf.Vec3f(0.08, 0.38, 0.9)])
+    _set_xform_pose(
+        UsdGeom.Xformable(neck.GetPrim()),
+        translate=(0.0, 0.0, -height * 0.5 + body_height + neck_height * 0.5),
+    )
+
+    cap_path = f"{prim_path}/cap"
+    cap = UsdGeom.Cylinder.Define(stage, cap_path)
+    cap.CreateAxisAttr("Z")
+    cap.CreateRadiusAttr(neck_radius * 1.15)
+    cap.CreateHeightAttr(cap_height)
+    cap.CreateDisplayColorAttr([Gf.Vec3f(0.95, 0.95, 0.9)])
+    _set_xform_pose(
+        UsdGeom.Xformable(cap.GetPrim()),
+        translate=(
+            0.0,
+            0.0,
+            -height * 0.5 + body_height + neck_height + cap_height * 0.5,
+        ),
+    )
+
+    root_prim = root.GetPrim()
+    rigid_body = UsdPhysics.RigidBodyAPI.Apply(root_prim)
+    rigid_body.CreateRigidBodyEnabledAttr(True)
+    mass_api = UsdPhysics.MassAPI.Apply(root_prim)
+    mass_api.CreateMassAttr(float(mass))
+    PhysxSchema.PhysxRigidBodyAPI.Apply(root_prim).CreateDisableGravityAttr(False)
+    for child_path in (body_path, neck_path, cap_path):
+        UsdPhysics.CollisionAPI.Apply(stage.GetPrimAtPath(child_path))
+
+
+def _spawn_target_object(
+    *, kind: str, prim_path: str, position: np.ndarray, size: float, mass: float
+) -> None:
+    if kind == "cube":
+        _spawn_cube(prim_path=prim_path, position=position, size=size, mass=mass)
+    elif kind == "bottle":
+        _spawn_bottle(prim_path=prim_path, position=position, height=size, mass=mass)
+    else:
+        raise ValueError(f"Unsupported target object kind: {kind!r}")
 
 
 def _spawn_table_if_requested(
@@ -779,6 +891,8 @@ def _init_scene(args: argparse.Namespace) -> tuple["SingleArticulation", dict[st
     loader = _load_loader_module()
     teleop = _load_teleop_module()
     world = _init_world()
+    if getattr(args, "table_top_z", None) is None:
+        args.table_top_z = _infer_table_top_z(args.cube_position, float(args.cube_size))
 
     loader._add_ground_plane()  # noqa: SLF001
     loader._add_scene_light()  # noqa: SLF001
@@ -786,9 +900,10 @@ def _init_scene(args: argparse.Namespace) -> tuple["SingleArticulation", dict[st
         enabled=bool(args.spawn_table),
         center_xy=np.asarray(args.cube_position[:2], dtype=np.float64),
         top_z=float(args.table_top_z),
-        table_xy_size=float(args.cube_size),
+        table_xy_size=float(args.table_xy_size),
     )
-    _spawn_cube(
+    _spawn_target_object(
+        kind=str(getattr(args, "target_object", "cube")),
         prim_path=str(args.cube_prim_path),
         position=np.asarray(args.cube_position, dtype=np.float64),
         size=float(args.cube_size),
@@ -940,6 +1055,12 @@ def _add_args(parser: argparse.ArgumentParser) -> None:
         "--open-camera-viewports", action=argparse.BooleanOptionalAction, default=False
     )
 
+    parser.add_argument(
+        "--target-object",
+        choices=("cube", "bottle"),
+        default="cube",
+        help="Object geometry to place at --cube-prim-path.",
+    )
     parser.add_argument("--cube-prim-path", type=str, default="/World/grasp_cube")
     parser.add_argument(
         "--cube-position",
@@ -950,7 +1071,18 @@ def _add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--cube-size", type=float, default=DEFAULT_CUBE_SIZE)
     parser.add_argument("--cube-mass", type=float, default=0.08)
     parser.add_argument("--spawn-table", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--table-top-z", type=float, default=DEFAULT_TABLE_TOP_Z)
+    parser.add_argument(
+        "--table-top-z",
+        type=float,
+        default=None,
+        help="Tabletop z height in meters. Defaults to cube_z - cube_size / 2.",
+    )
+    parser.add_argument(
+        "--table-xy-size",
+        type=float,
+        default=DEFAULT_TABLE_XY_SIZE,
+        help="Square tabletop side length in meters.",
+    )
 
     parser.add_argument(
         "--initial-arm-q",
@@ -1014,6 +1146,8 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
     AppLauncher.add_app_launcher_args(parser)
     args = parser.parse_args()
     args.cube_position = _parse_vector(str(args.cube_position), 3, name="--cube-position")
+    if args.table_top_z is None:
+        args.table_top_z = _infer_table_top_z(args.cube_position, float(args.cube_size))
     args.initial_eef_xyz = _parse_vector(str(args.initial_eef_xyz), 3, name="--initial-eef-xyz")
     args.workspace_min = _parse_vector(str(args.workspace_min), 3, name="--workspace-min")
     args.workspace_max = _parse_vector(str(args.workspace_max), 3, name="--workspace-max")
@@ -1085,7 +1219,8 @@ def main() -> None:
         _set_target_marker(marker_path, executor.target_xyz)
 
         print(
-            f"[scene] cube={args.cube_prim_path} pos={args.cube_position.tolist()} "
+            f"[scene] target_object={getattr(args, 'target_object', 'cube')} "
+            f"prim={args.cube_prim_path} pos={args.cube_position.tolist()} "
             f"size={float(args.cube_size):.3f}m",
             flush=True,
         )

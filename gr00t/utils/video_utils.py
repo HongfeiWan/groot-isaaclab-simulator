@@ -19,7 +19,6 @@ import math
 import subprocess
 from typing import List, Optional, Tuple
 
-import av
 import cv2
 import numpy as np
 import torchvision
@@ -55,6 +54,16 @@ def _lazy_import_decord():
         raise ImportError("decord is not available. Install it with: pip install decord")
 
 
+def _lazy_import_av():
+    """Lazily import PyAV, raising ImportError if unavailable."""
+    try:
+        import av
+
+        return av
+    except ImportError as exc:
+        raise ImportError("PyAV is not available. Install it with: pip install av==16.1.0") from exc
+
+
 # Known-bad backend+codec combinations that cause silent failures (issue #342).
 # torchvision_av with h265/hevc reads only the first frame without error,
 # leading to policies that train but never learn from visual input.
@@ -77,8 +86,14 @@ def _is_backend_available(backend: str) -> bool:
             return True
         except ImportError:
             return False
-    elif backend in ("ffmpeg", "opencv", "pyav", "torchvision_av"):
+    elif backend in ("ffmpeg", "opencv", "torchvision_av"):
         return True
+    elif backend == "pyav":
+        try:
+            _lazy_import_av()
+            return True
+        except ImportError:
+            return False
     return False
 
 
@@ -538,6 +553,7 @@ def get_all_frames(
     elif video_backend == "ffmpeg":
         return _extract_all_frames_ffmpeg(video_path)
     elif video_backend == "pyav":
+        av = _lazy_import_av()
         with av.open(video_path) as container:
             stream = container.streams.video[0]
             assert stream.time_base is not None

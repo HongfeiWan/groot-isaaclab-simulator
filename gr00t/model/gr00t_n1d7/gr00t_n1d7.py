@@ -22,7 +22,6 @@ from torch.distributions import Beta
 import torch.nn.functional as F
 from transformers import AutoConfig, AutoModel, PreTrainedModel
 from transformers.feature_extraction_utils import BatchFeature
-import tree
 
 from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
 from gr00t.model.modules.dit import AlternateVLDiT, DiT, SelfAttentionTransformer
@@ -33,6 +32,19 @@ from gr00t.model.modules.embodiment_conditioned_mlp import (
 
 
 logger = logging.getLogger(__name__)
+
+
+def _map_structure(fn, value):
+    """Small local replacement for dm-tree's map_structure used by inference."""
+    if isinstance(value, BatchFeature):
+        return BatchFeature({k: _map_structure(fn, v) for k, v in value.items()})
+    if isinstance(value, dict):
+        return {k: _map_structure(fn, v) for k, v in value.items()}
+    if isinstance(value, tuple):
+        return tuple(_map_structure(fn, v) for v in value)
+    if isinstance(value, list):
+        return [_map_structure(fn, v) for v in value]
+    return fn(value)
 
 
 class Gr00tN1d7ActionHead(nn.Module):
@@ -563,8 +575,8 @@ class Gr00tN1d7(PreTrainedModel):
             else:
                 return x.to(self.device)
 
-        backbone_inputs = tree.map_structure(to_device_with_dtype, backbone_inputs)
-        action_inputs = tree.map_structure(to_device_with_dtype, action_inputs)
+        backbone_inputs = _map_structure(to_device_with_dtype, backbone_inputs)
+        action_inputs = _map_structure(to_device_with_dtype, action_inputs)
 
         return backbone_inputs, action_inputs
 

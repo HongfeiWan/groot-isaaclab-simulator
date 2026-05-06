@@ -149,3 +149,10 @@ python examples/IsaacLab/evaluate_l10_overfit_on_trimmed_dataset.py \
   --episode-indices 0 1 2 \
   --no-plot
 ```
+
+
+### 12.自己写的bench mark
+Run with Isaac Lab's Python:
+```bash
+LD_PRELOAD="$CONDA_PREFIX/lib/libstdc++.so.6"   ~/Project/IsaacLab/isaaclab.sh -p examples/IsaacLab/evaluate_rokae_l10_bench_v0.py   --enable_cameras   --model-dir checkpoints/rokae_xmate3_l10_overfit   --dataset-dir outputs/IsaacLab/trimmed_l10_dataset   --num-trials 5  --image-height 800 --image-width 1200 --target-object bottle --cube-size 0.14 --cube-mass 0.06 --instruction "pick up the bottle and place it in the box" --cube-position=-0.7,-0.6,0.2
+```

@@ -13,14 +13,40 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
 from typing import Sequence
 import warnings
 
-import albumentations as A
 import cv2
 import numpy as np
 import torch
 import torchvision.transforms.v2 as transforms
+
+
+try:
+    import albumentations as A
+
+    _ALBUMENTATIONS_IMPORT_ERROR: Exception | None = None
+except Exception as exc:
+    _ALBUMENTATIONS_IMPORT_ERROR = exc
+
+    class _UnavailableAlbumentationsTransform:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    A = SimpleNamespace(  # type: ignore[assignment]
+        ImageOnlyTransform=_UnavailableAlbumentationsTransform,
+        DualTransform=_UnavailableAlbumentationsTransform,
+    )
+
+
+def _require_albumentations():
+    if _ALBUMENTATIONS_IMPORT_ERROR is not None:
+        raise ImportError(
+            "albumentations could not be imported. This is only required when "
+            "use_albumentations_transforms=True."
+        ) from _ALBUMENTATIONS_IMPORT_ERROR
+    return A
 
 
 def apply_with_replay(transform, images, masks=None, replay=None):
@@ -402,6 +428,7 @@ def build_image_transformations_albumentations(
     Returns:
         tuple: (train_transform, eval_transform) - raw albumentations transforms
     """
+    A = _require_albumentations()
 
     if crop_fraction is None:
         fraction_to_use = image_crop_size[0] / image_target_size[0]

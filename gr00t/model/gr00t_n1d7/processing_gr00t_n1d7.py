@@ -22,11 +22,9 @@ import re
 from typing import Any, Dict
 import warnings
 
-import albumentations as A
 import numpy as np
 from PIL import Image
 import torch
-import torchvision.transforms.v2 as transforms
 from transformers import AutoProcessor
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.utils import cached_file
@@ -228,17 +226,31 @@ class Gr00tN1d7Processor(BaseProcessor):
         # Choose between torchvision and albumentations transforms
         self.use_albumentations = use_albumentations
         if use_albumentations:
-            self.train_image_transform, self.eval_image_transform = (
-                build_image_transformations_albumentations(
+            try:
+                self.train_image_transform, self.eval_image_transform = (
+                    build_image_transformations_albumentations(
+                        image_target_size,
+                        image_crop_size,
+                        random_rotation_angle,
+                        color_jitter_params,
+                        shortest_image_edge,
+                        crop_fraction,
+                        extra_augmentation_config=self.extra_augmentation_config,
+                    )
+                )
+            except ImportError as exc:
+                warnings.warn(
+                    "Falling back to torchvision image transforms because albumentations "
+                    f"is unavailable or incompatible: {exc}",
+                    RuntimeWarning,
+                )
+                self.use_albumentations = False
+                self.train_image_transform, self.eval_image_transform = build_image_transformations(
                     image_target_size,
                     image_crop_size,
                     random_rotation_angle,
                     color_jitter_params,
-                    shortest_image_edge,
-                    crop_fraction,
-                    extra_augmentation_config=self.extra_augmentation_config,
                 )
-            )
         else:
             self.train_image_transform, self.eval_image_transform = build_image_transformations(
                 image_target_size,
@@ -605,7 +617,7 @@ class Gr00tN1d7Processor(BaseProcessor):
         image_keys: list[str],
         images: list[Image.Image],
         masks: dict[str, list[np.ndarray]] | None,
-        image_transform: transforms.Compose | A.Compose,
+        image_transform: Any,
         language: str,
     ):
         temporal_stacked_images = {}
